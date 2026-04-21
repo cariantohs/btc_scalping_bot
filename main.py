@@ -16,21 +16,25 @@ from telegram.error import TelegramError
 import ta
 import joblib
 
+# Muat variabel lingkungan
 load_dotenv()
 
+# Konfigurasi logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Variabel lingkungan
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 PORT = int(os.getenv('PORT', 8080))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di-set")
+    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di-set di environment variables")
 
+# Inisialisasi bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # ---------- Muat Model ML ----------
@@ -43,7 +47,7 @@ except FileNotFoundError:
 except Exception as e:
     logger.error(f"❌ Gagal memuat model ML: {e}")
 
-# ---------- Muat HMM ----------
+# ---------- Muat Model HMM ----------
 hmm_model = None
 hmm_scaler = None
 try:
@@ -55,6 +59,7 @@ except FileNotFoundError:
 except Exception as e:
     logger.error(f"❌ Gagal memuat HMM: {e}")
 
+# State pasar saat ini
 current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
@@ -152,7 +157,6 @@ class PerformanceTracker:
 
     def open_position(self, signal: str, price: float):
         if self.open_trade is not None:
-            # Paksa tutup posisi sebelumnya jika ada (harusnya tidak terjadi)
             self.close_position(price, "forced_new_signal")
 
         trade = PaperTrade(signal, price, datetime.now())
@@ -166,7 +170,7 @@ class PerformanceTracker:
         trade = self.open_trade
         if trade.signal == 'LONG':
             pnl = (current_price - trade.entry_price) / trade.entry_price * 100
-        else:  # SHORT
+        else:
             pnl = (trade.entry_price - current_price) / trade.entry_price * 100
 
         trade.exit_price = current_price
@@ -185,12 +189,10 @@ class PerformanceTracker:
         self.open_trade = None
 
     def update_trailing_stop(self, current_price: float):
-        """Cek apakah posisi harus ditutup karena trailing stop."""
         if self.open_trade is None:
             return
 
         trade = self.open_trade
-        # Trailing stop 0.15% dari harga entry
         trailing_pct = 0.15
         if trade.signal == 'LONG':
             stop_price = trade.entry_price * (1 - trailing_pct / 100)
@@ -244,6 +246,8 @@ def update_market_regime():
     logger.info(f"🔄 Rezim pasar: {regime_names.get(state, 'UNKNOWN')}")
 
 def get_current_regime_name() -> str:
+    if current_regime == -1:
+        return "MENGUMPULKAN DATA..."
     return regime_names.get(current_regime, "UNKNOWN")
 
 # ---------- Strategi ----------
@@ -346,7 +350,6 @@ async def handle_kline(data: Dict):
         return
     is_closed = k.get('x', False)
 
-    # Selalu update harga terbaru untuk trailing stop (baik closed maupun belum)
     current_price = float(k.get('c', 0))
     if tracker.open_trade is not None:
         tracker.update_trailing_stop(current_price)
@@ -375,7 +378,6 @@ async def handle_kline(data: Dict):
     if df.empty:
         return
 
-    # Jika ada posisi terbuka dan candle kelipatan 5 (5 menit), tutup paksa (time-based exit)
     if tracker.open_trade is not None:
         trade_open_time = tracker.open_trade.timestamp
         if datetime.now() - trade_open_time >= timedelta(minutes=5):
@@ -383,7 +385,6 @@ async def handle_kline(data: Dict):
 
     signal = generate_signal(df)
     if signal:
-        # Buka posisi baru (akan otomatis menutup posisi lama jika ada)
         tracker.open_position(signal, current_price)
 
         imbalance = micro_cache.get_order_book_imbalance()
@@ -417,7 +418,7 @@ async def unified_socket_listener():
 
     try:
         async with bm.futures_multiplex_socket(streams) as stream:
-            logger.info("🔌 Terhubung ke multiple FUTURES streams (Fase 3 + Tracker)")
+            logger.info("🔌 Terhubung ke multiple FUTURES streams")
 
             async def keep_alive():
                 while True:
@@ -453,18 +454,23 @@ async def unified_socket_listener():
     finally:
         await client.close_connection()
 
-# ---------- HTTP Server ----------
+# ---------- HTTP Server untuk Health Check ----------
 async def health_check(request):
     return web.Response(text="Bot aktif")
+
+async def kaith_health_check(request):
+    """Endpoint khusus untuk Leapcell health check."""
+    return web.Response(text="OK")
 
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/', health_check)
+    app.router.add_get('/kaithhealth', kaith_health_check)  # Endpoint Leapcell
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌐 HTTP server port {PORT}")
+    logger.info(f"🌐 HTTP server berjalan di port {PORT} (health: /kaithhealth)")
 
 # ---------- Main ----------
 async def main():
