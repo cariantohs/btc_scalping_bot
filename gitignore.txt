@@ -1,0 +1,25 @@
+# Environment variables (token rahasia)
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# File data besar (opsional)
+*.csv
+
+# Log file
+*.log
+
+# Model files (jika ingin mengecualikan sementara)
+# *.pkl
+
+# IDE settings
+.vscode/
+.idea/
