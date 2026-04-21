@@ -37,27 +37,10 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # Inisialisasi bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Muat Model ML (LightGBM) ----------
+# ---------- Model akan dimuat nanti (setelah HTTP server siap) ----------
 model = None
-try:
-    model = joblib.load('scalping_model_v1.pkl')
-    logger.info("✅ Model ML v1 berhasil dimuat")
-except FileNotFoundError:
-    logger.warning("⚠️ Model ML tidak ditemukan, fallback ke strategi sederhana")
-except Exception as e:
-    logger.error(f"❌ Gagal memuat model ML: {e}")
-
-# ---------- Muat Model HMM untuk Deteksi Rezim ----------
 hmm_model = None
 hmm_scaler = None
-try:
-    hmm_model = joblib.load('hmm_model.pkl')
-    hmm_scaler = joblib.load('hmm_scaler.pkl')
-    logger.info("✅ Model HMM untuk deteksi rezim berhasil dimuat")
-except FileNotFoundError:
-    logger.warning("⚠️ Model HMM tidak ditemukan, deteksi rezim dinonaktifkan")
-except Exception as e:
-    logger.error(f"❌ Gagal memuat HMM: {e}")
 
 # State pasar saat ini
 current_regime = -1
@@ -465,15 +448,42 @@ async def kaith_health_check(request):
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/', health_check)
-    app.router.add_get('/kaithheathcheck', kaith_health_check)   # <-- Ejaan sesuai permintaan Leapcell
+    app.router.add_get('/kaithheathcheck', kaith_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logger.info(f"🌐 HTTP server berjalan di port {PORT} (health: /kaithheathcheck)")
 
+# ---------- Fungsi untuk memuat model (dilakukan setelah HTTP server siap) ----------
+def load_models():
+    global model, hmm_model, hmm_scaler
+    try:
+        model = joblib.load('scalping_model_v1.pkl')
+        logger.info("✅ Model ML v1 berhasil dimuat")
+    except FileNotFoundError:
+        logger.warning("⚠️ Model ML tidak ditemukan, fallback ke strategi sederhana")
+    except Exception as e:
+        logger.error(f"❌ Gagal memuat model ML: {e}")
+
+    try:
+        hmm_model = joblib.load('hmm_model.pkl')
+        hmm_scaler = joblib.load('hmm_scaler.pkl')
+        logger.info("✅ Model HMM untuk deteksi rezim berhasil dimuat")
+    except FileNotFoundError:
+        logger.warning("⚠️ Model HMM tidak ditemukan, deteksi rezim dinonaktifkan")
+    except Exception as e:
+        logger.error(f"❌ Gagal memuat HMM: {e}")
+
 # ---------- Fungsi Utama ----------
 async def main():
+    # Mulai HTTP server terlebih dahulu
+    await start_http_server()
+
+    # Muat model (setelah server siap, tidak memblokir health check)
+    load_models()
+
+    # Kirim notifikasi startup ke Telegram
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -482,10 +492,8 @@ async def main():
     except Exception as e:
         logger.error(f"Gagal kirim notifikasi startup: {e}")
 
-    await asyncio.gather(
-        start_http_server(),
-        unified_socket_listener()
-    )
+    # Jalankan WebSocket listener (ini akan berjalan selamanya)
+    await unified_socket_listener()
 
 if __name__ == '__main__':
     try:
