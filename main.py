@@ -465,7 +465,7 @@ async def kaith_health_check(request):
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/', health_check)
-    app.router.add_get('/kaithheathcheck', kaith_health_check)   # <-- Ejaan sesuai log Leapcell
+    app.router.add_get('/kaithheathcheck', kaith_health_check)   # <-- Ejaan sesuai permintaan Leapcell
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
