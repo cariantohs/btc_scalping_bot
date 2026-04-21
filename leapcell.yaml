@@ -1,0 +1,3 @@
+runtime: python
+entrypoint: python main.py
+health_check_path: /kaithhealth
