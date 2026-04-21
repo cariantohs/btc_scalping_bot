@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Variabel lingkungan
+# Variabel lingkungan (di-set di dashboard Leapcell)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 PORT = int(os.getenv('PORT', 8080))
@@ -37,23 +37,23 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # Inisialisasi bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Muat Model ML ----------
+# ---------- Muat Model ML (LightGBM) ----------
 model = None
 try:
     model = joblib.load('scalping_model_v1.pkl')
-    logger.info("✅ Model ML v1 dimuat")
+    logger.info("✅ Model ML v1 berhasil dimuat")
 except FileNotFoundError:
     logger.warning("⚠️ Model ML tidak ditemukan, fallback ke strategi sederhana")
 except Exception as e:
     logger.error(f"❌ Gagal memuat model ML: {e}")
 
-# ---------- Muat Model HMM ----------
+# ---------- Muat Model HMM untuk Deteksi Rezim ----------
 hmm_model = None
 hmm_scaler = None
 try:
     hmm_model = joblib.load('hmm_model.pkl')
     hmm_scaler = joblib.load('hmm_scaler.pkl')
-    logger.info("✅ Model HMM untuk deteksi rezim dimuat")
+    logger.info("✅ Model HMM untuk deteksi rezim berhasil dimuat")
 except FileNotFoundError:
     logger.warning("⚠️ Model HMM tidak ditemukan, deteksi rezim dinonaktifkan")
 except Exception as e:
@@ -64,7 +64,7 @@ current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
 
-# ---------- Cache Mikrostruktur ----------
+# ---------- Cache Mikrostruktur Pasar ----------
 class MicrostructureCache:
     def __init__(self):
         self.bids: List[List[float]] = []
@@ -113,7 +113,7 @@ class MicrostructureCache:
 
 micro_cache = MicrostructureCache()
 
-# ---------- Cache OHLCV ----------
+# ---------- Cache Data OHLCV ----------
 class DataCache:
     def __init__(self, maxlen=500):
         self.candles = []
@@ -136,7 +136,7 @@ class DataCache:
 
 cache = DataCache(maxlen=200)
 
-# ---------- Paper Trading Simulator ----------
+# ---------- Simulasi Paper Trading ----------
 class PaperTrade:
     def __init__(self, signal: str, entry_price: float, timestamp: datetime):
         self.signal = signal
@@ -161,7 +161,7 @@ class PerformanceTracker:
 
         trade = PaperTrade(signal, price, datetime.now())
         self.open_trade = trade
-        logger.info(f"📊 Paper trade opened: {signal} @ {price:.2f}")
+        logger.info(f"📊 Paper trade dibuka: {signal} @ {price:.2f}")
 
     def close_position(self, current_price: float, reason: str = "signal"):
         if self.open_trade is None:
@@ -185,7 +185,7 @@ class PerformanceTracker:
         else:
             self.losses += 1
 
-        logger.info(f"📊 Paper trade closed: {trade.signal} PnL: {pnl:.3f}% | Reason: {reason}")
+        logger.info(f"📊 Paper trade ditutup: {trade.signal} PnL: {pnl:.3f}% | Alasan: {reason}")
         self.open_trade = None
 
     def update_trailing_stop(self, current_price: float):
@@ -219,7 +219,7 @@ class PerformanceTracker:
 
 tracker = PerformanceTracker()
 
-# ---------- Fungsi Update Rezim ----------
+# ---------- Fungsi Update Rezim Pasar ----------
 def update_market_regime():
     global current_regime, last_regime_update
     if hmm_model is None or hmm_scaler is None:
@@ -243,14 +243,14 @@ def update_market_regime():
     state = hmm_model.predict(latest_scaled)[0]
     current_regime = state
     last_regime_update = datetime.now()
-    logger.info(f"🔄 Rezim pasar: {regime_names.get(state, 'UNKNOWN')}")
+    logger.info(f"🔄 Rezim pasar diperbarui: {regime_names.get(state, 'UNKNOWN')} (State {state})")
 
 def get_current_regime_name() -> str:
     if current_regime == -1:
         return "MENGUMPULKAN DATA..."
     return regime_names.get(current_regime, "UNKNOWN")
 
-# ---------- Strategi ----------
+# ---------- Strategi Trading ----------
 def generate_signal(df: pd.DataFrame) -> Optional[str]:
     selected_model = model
     if selected_model is None or len(df) < 26:
@@ -318,7 +318,7 @@ def generate_signal_fallback(df: pd.DataFrame) -> Optional[str]:
         return 'SHORT'
     return None
 
-# ---------- Kirim Sinyal + Statistik ----------
+# ---------- Kirim Sinyal + Statistik ke Telegram ----------
 async def send_telegram_signal(signal: str, price: float, additional: str = ""):
     emoji = "🟢" if signal == "LONG" else "🔴"
     stats = tracker.get_stats()
@@ -339,9 +339,9 @@ async def send_telegram_signal(signal: str, price: float, additional: str = ""):
     )
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
-        logger.info(f"📤 Sinyal {signal} + statistik terkirim")
+        logger.info(f"📤 Sinyal {signal} dan statistik terkirim ke Telegram")
     except TelegramError as e:
-        logger.error(f"Gagal kirim: {e}")
+        logger.error(f"Gagal kirim Telegram: {e}")
 
 # ---------- Handler WebSocket ----------
 async def handle_kline(data: Dict):
@@ -366,7 +366,7 @@ async def handle_kline(data: Dict):
         'volume': float(k['v']),
     }
     cache.add_candle(candle)
-    logger.info(f"✅ Candle closed: {candle['close']:.2f}")
+    logger.info(f"✅ Candle 1m ditutup: {candle['close']:.2f}")
 
     micro_cache.reset_candle_cvd()
 
@@ -405,7 +405,7 @@ async def handle_agg_trade(data: Dict):
     is_buyer_maker = data.get('m', False)
     micro_cache.add_trade(price, qty, is_buyer_maker)
 
-# ---------- Listener Utama ----------
+# ---------- Listener Utama WebSocket ----------
 async def unified_socket_listener():
     client = await AsyncClient.create()
     bm = BinanceSocketManager(client)
@@ -418,7 +418,7 @@ async def unified_socket_listener():
 
     try:
         async with bm.futures_multiplex_socket(streams) as stream:
-            logger.info("🔌 Terhubung ke multiple FUTURES streams")
+            logger.info("🔌 Terhubung ke multiple FUTURES streams (kline, depth, aggTrade)")
 
             async def keep_alive():
                 while True:
@@ -454,33 +454,33 @@ async def unified_socket_listener():
     finally:
         await client.close_connection()
 
-# ---------- HTTP Server untuk Health Check ----------
+# ---------- HTTP Server untuk Health Check Leapcell ----------
 async def health_check(request):
     return web.Response(text="Bot aktif")
 
 async def kaith_health_check(request):
-    """Endpoint khusus untuk Leapcell health check."""
+    """Endpoint khusus Leapcell: /kaithheathcheck"""
     return web.Response(text="OK")
 
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/', health_check)
-    app.router.add_get('/kaithhealth', kaith_health_check)  # Endpoint Leapcell
+    app.router.add_get('/kaithheathcheck', kaith_health_check)   # <-- Ejaan sesuai log Leapcell
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌐 HTTP server berjalan di port {PORT} (health: /kaithhealth)")
+    logger.info(f"🌐 HTTP server berjalan di port {PORT} (health: /kaithheathcheck)")
 
-# ---------- Main ----------
+# ---------- Fungsi Utama ----------
 async def main():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + Statistik"
+            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + Statistik Kumulatif"
         )
     except Exception as e:
-        logger.error(f"Startup notify error: {e}")
+        logger.error(f"Gagal kirim notifikasi startup: {e}")
 
     await asyncio.gather(
         start_http_server(),
@@ -491,4 +491,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped")
+        logger.info("🛑 Bot dihentikan manual")
