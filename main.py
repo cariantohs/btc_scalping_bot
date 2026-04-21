@@ -477,13 +477,13 @@ def load_models():
 
 # ---------- Fungsi Utama ----------
 async def main():
-    # Mulai HTTP server terlebih dahulu
+    # 1. Mulai HTTP server terlebih dahulu agar health check Leapcell langsung berhasil
     await start_http_server()
 
-    # Muat model (setelah server siap, tidak memblokir health check)
+    # 2. Muat model (setelah server siap, tidak memblokir health check)
     load_models()
 
-    # Kirim notifikasi startup ke Telegram
+    # 3. Kirim notifikasi startup ke Telegram
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -492,7 +492,7 @@ async def main():
     except Exception as e:
         logger.error(f"Gagal kirim notifikasi startup: {e}")
 
-    # Jalankan WebSocket listener (ini akan berjalan selamanya)
+    # 4. Jalankan WebSocket listener (ini akan berjalan selamanya)
     await unified_socket_listener()
 
 if __name__ == '__main__':
