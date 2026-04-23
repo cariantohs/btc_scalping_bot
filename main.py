@@ -15,6 +15,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 import ta
 import joblib
+import loky
 
 # Muat variabel lingkungan
 load_dotenv()
@@ -26,7 +27,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Variabel lingkungan (di-set di dashboard Leapcell)
+# Nonaktifkan backend multiprocessing joblib
+try:
+    from joblib import parallel_backend
+    parallel_backend('loky', n_jobs=1)
+except:
+    pass
+
+# Variabel lingkungan
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 PORT = int(os.getenv('PORT', 8080))
@@ -37,7 +45,7 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # Inisialisasi bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Model akan dimuat nanti (setelah HTTP server siap) ----------
+# ---------- Model akan dimuat nanti ----------
 model = None
 hmm_model = None
 hmm_scaler = None
@@ -437,25 +445,20 @@ async def unified_socket_listener():
     finally:
         await client.close_connection()
 
-# ---------- HTTP Server untuk Health Check Leapcell ----------
+# ---------- HTTP Server ----------
 async def health_check(request):
-    return web.Response(text="Bot aktif")
-
-async def kaith_health_check(request):
-    """Endpoint khusus Leapcell: /kaithheathcheck"""
     return web.Response(text="OK")
 
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/', health_check)
-    app.router.add_get('/kaithheathcheck', kaith_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌐 HTTP server berjalan di port {PORT} (health: /kaithheathcheck)")
+    logger.info(f"🌐 HTTP server berjalan di port {PORT} untuk health check")
 
-# ---------- Fungsi untuk memuat model (dilakukan setelah HTTP server siap) ----------
+# ---------- Fungsi untuk memuat model ----------
 def load_models():
     global model, hmm_model, hmm_scaler
     try:
@@ -477,11 +480,12 @@ def load_models():
 
 # ---------- Fungsi Utama ----------
 async def main():
-    # 1. Mulai HTTP server terlebih dahulu agar health check Leapcell langsung berhasil
-    await start_http_server()
-
-    # 2. Muat model (setelah server siap, tidak memblokir health check)
+    # 1. Muat model terlebih dahulu
     load_models()
+
+    # 2. Mulai HTTP server sebagai background task
+    http_server_task = asyncio.create_task(start_http_server())
+    await asyncio.sleep(1)  # Beri waktu server untuk siap
 
     # 3. Kirim notifikasi startup ke Telegram
     try:
@@ -493,7 +497,12 @@ async def main():
         logger.error(f"Gagal kirim notifikasi startup: {e}")
 
     # 4. Jalankan WebSocket listener (ini akan berjalan selamanya)
-    await unified_socket_listener()
+    try:
+        await unified_socket_listener()
+    except Exception as e:
+        logger.error(f"WebSocket listener error: {e}")
+    finally:
+        http_server_task.cancel()
 
 if __name__ == '__main__':
     try:
