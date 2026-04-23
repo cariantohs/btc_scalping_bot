@@ -1,15 +1,21 @@
-# 1. Pilih base image Python (versi 3.10)
+# Gunakan image resmi Python
 FROM python:3.10-slim
 
-# 2. Set working directory di dalam container
+# Izinkan output Python langsung tampil di log
+ENV PYTHONUNBUFFERED True
+
+# Setel direktori kerja di dalam container
 WORKDIR /app
 
-# 3. Salin file requirements.txt dan install dependensi
+# Salin file requirements dan install dependensi
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Salin seluruh kode proyek ke dalam container
+# Salin semua kode aplikasi
 COPY . .
 
-# 5. Jalankan bot
+# Ekspos port 8080 untuk health check Back4App (WAJIB)
+EXPOSE 8080
+
+# Jalankan bot (server HTTP akan berjalan di dalam main.py)
 CMD ["python", "main.py"]
