@@ -15,7 +15,6 @@ from telegram import Bot
 from telegram.error import TelegramError
 import ta
 import joblib
-import loky
 
 # Muat variabel lingkungan
 load_dotenv()
@@ -26,13 +25,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Nonaktifkan backend multiprocessing joblib
-try:
-    from joblib import parallel_backend
-    parallel_backend('loky', n_jobs=1)
-except:
-    pass
 
 # Variabel lingkungan
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
