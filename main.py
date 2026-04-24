@@ -16,38 +16,50 @@ from telegram.error import TelegramError
 import ta
 import joblib
 
-# Muat variabel lingkungan
 load_dotenv()
 
-# Konfigurasi logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Variabel lingkungan
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 PORT = int(os.getenv('PORT', 8080))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di-set di environment variables")
+    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di-set")
 
-# Inisialisasi bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Model akan dimuat nanti ----------
+# ---------- Muat Model ML ----------
 model = None
+try:
+    model = joblib.load('scalping_model_v1.pkl')
+    logger.info("✅ Model ML v1 dimuat")
+except FileNotFoundError:
+    logger.warning("⚠️ Model ML tidak ditemukan, fallback ke strategi sederhana")
+except Exception as e:
+    logger.error(f"❌ Gagal memuat model ML: {e}")
+
+# ---------- Muat HMM ----------
 hmm_model = None
 hmm_scaler = None
+try:
+    hmm_model = joblib.load('hmm_model.pkl')
+    hmm_scaler = joblib.load('hmm_scaler.pkl')
+    logger.info("✅ Model HMM untuk deteksi rezim dimuat")
+except FileNotFoundError:
+    logger.warning("⚠️ Model HMM tidak ditemukan, deteksi rezim dinonaktifkan")
+except Exception as e:
+    logger.error(f"❌ Gagal memuat HMM: {e}")
 
-# State pasar saat ini
 current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
 
-# ---------- Cache Mikrostruktur Pasar ----------
+# ---------- Cache Mikrostruktur ----------
 class MicrostructureCache:
     def __init__(self):
         self.bids: List[List[float]] = []
@@ -96,7 +108,7 @@ class MicrostructureCache:
 
 micro_cache = MicrostructureCache()
 
-# ---------- Cache Data OHLCV ----------
+# ---------- Cache OHLCV ----------
 class DataCache:
     def __init__(self, maxlen=500):
         self.candles = []
@@ -119,7 +131,7 @@ class DataCache:
 
 cache = DataCache(maxlen=200)
 
-# ---------- Simulasi Paper Trading ----------
+# ---------- Paper Trading Simulator ----------
 class PaperTrade:
     def __init__(self, signal: str, entry_price: float, timestamp: datetime):
         self.signal = signal
@@ -140,11 +152,12 @@ class PerformanceTracker:
 
     def open_position(self, signal: str, price: float):
         if self.open_trade is not None:
+            # Paksa tutup posisi sebelumnya jika ada (harusnya tidak terjadi)
             self.close_position(price, "forced_new_signal")
 
         trade = PaperTrade(signal, price, datetime.now())
         self.open_trade = trade
-        logger.info(f"📊 Paper trade dibuka: {signal} @ {price:.2f}")
+        logger.info(f"📊 Paper trade opened: {signal} @ {price:.2f}")
 
     def close_position(self, current_price: float, reason: str = "signal"):
         if self.open_trade is None:
@@ -153,7 +166,7 @@ class PerformanceTracker:
         trade = self.open_trade
         if trade.signal == 'LONG':
             pnl = (current_price - trade.entry_price) / trade.entry_price * 100
-        else:
+        else:  # SHORT
             pnl = (trade.entry_price - current_price) / trade.entry_price * 100
 
         trade.exit_price = current_price
@@ -168,14 +181,16 @@ class PerformanceTracker:
         else:
             self.losses += 1
 
-        logger.info(f"📊 Paper trade ditutup: {trade.signal} PnL: {pnl:.3f}% | Alasan: {reason}")
+        logger.info(f"📊 Paper trade closed: {trade.signal} PnL: {pnl:.3f}% | Reason: {reason}")
         self.open_trade = None
 
     def update_trailing_stop(self, current_price: float):
+        """Cek apakah posisi harus ditutup karena trailing stop."""
         if self.open_trade is None:
             return
 
         trade = self.open_trade
+        # Trailing stop 0.15% dari harga entry
         trailing_pct = 0.15
         if trade.signal == 'LONG':
             stop_price = trade.entry_price * (1 - trailing_pct / 100)
@@ -202,7 +217,7 @@ class PerformanceTracker:
 
 tracker = PerformanceTracker()
 
-# ---------- Fungsi Update Rezim Pasar ----------
+# ---------- Fungsi Update Rezim ----------
 def update_market_regime():
     global current_regime, last_regime_update
     if hmm_model is None or hmm_scaler is None:
@@ -226,14 +241,12 @@ def update_market_regime():
     state = hmm_model.predict(latest_scaled)[0]
     current_regime = state
     last_regime_update = datetime.now()
-    logger.info(f"🔄 Rezim pasar diperbarui: {regime_names.get(state, 'UNKNOWN')} (State {state})")
+    logger.info(f"🔄 Rezim pasar: {regime_names.get(state, 'UNKNOWN')}")
 
 def get_current_regime_name() -> str:
-    if current_regime == -1:
-        return "MENGUMPULKAN DATA..."
     return regime_names.get(current_regime, "UNKNOWN")
 
-# ---------- Strategi Trading ----------
+# ---------- Strategi ----------
 def generate_signal(df: pd.DataFrame) -> Optional[str]:
     selected_model = model
     if selected_model is None or len(df) < 26:
@@ -301,7 +314,7 @@ def generate_signal_fallback(df: pd.DataFrame) -> Optional[str]:
         return 'SHORT'
     return None
 
-# ---------- Kirim Sinyal + Statistik ke Telegram ----------
+# ---------- Kirim Sinyal + Statistik ----------
 async def send_telegram_signal(signal: str, price: float, additional: str = ""):
     emoji = "🟢" if signal == "LONG" else "🔴"
     stats = tracker.get_stats()
@@ -322,9 +335,9 @@ async def send_telegram_signal(signal: str, price: float, additional: str = ""):
     )
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
-        logger.info(f"📤 Sinyal {signal} dan statistik terkirim ke Telegram")
+        logger.info(f"📤 Sinyal {signal} + statistik terkirim")
     except TelegramError as e:
-        logger.error(f"Gagal kirim Telegram: {e}")
+        logger.error(f"Gagal kirim: {e}")
 
 # ---------- Handler WebSocket ----------
 async def handle_kline(data: Dict):
@@ -333,6 +346,7 @@ async def handle_kline(data: Dict):
         return
     is_closed = k.get('x', False)
 
+    # Selalu update harga terbaru untuk trailing stop (baik closed maupun belum)
     current_price = float(k.get('c', 0))
     if tracker.open_trade is not None:
         tracker.update_trailing_stop(current_price)
@@ -349,7 +363,7 @@ async def handle_kline(data: Dict):
         'volume': float(k['v']),
     }
     cache.add_candle(candle)
-    logger.info(f"✅ Candle 1m ditutup: {candle['close']:.2f}")
+    logger.info(f"✅ Candle closed: {candle['close']:.2f}")
 
     micro_cache.reset_candle_cvd()
 
@@ -361,6 +375,7 @@ async def handle_kline(data: Dict):
     if df.empty:
         return
 
+    # Jika ada posisi terbuka dan candle kelipatan 5 (5 menit), tutup paksa (time-based exit)
     if tracker.open_trade is not None:
         trade_open_time = tracker.open_trade.timestamp
         if datetime.now() - trade_open_time >= timedelta(minutes=5):
@@ -368,6 +383,7 @@ async def handle_kline(data: Dict):
 
     signal = generate_signal(df)
     if signal:
+        # Buka posisi baru (akan otomatis menutup posisi lama jika ada)
         tracker.open_position(signal, current_price)
 
         imbalance = micro_cache.get_order_book_imbalance()
@@ -388,7 +404,7 @@ async def handle_agg_trade(data: Dict):
     is_buyer_maker = data.get('m', False)
     micro_cache.add_trade(price, qty, is_buyer_maker)
 
-# ---------- Listener Utama WebSocket ----------
+# ---------- Listener Utama ----------
 async def unified_socket_listener():
     client = await AsyncClient.create()
     bm = BinanceSocketManager(client)
@@ -401,7 +417,7 @@ async def unified_socket_listener():
 
     try:
         async with bm.futures_multiplex_socket(streams) as stream:
-            logger.info("🔌 Terhubung ke multiple FUTURES streams (kline, depth, aggTrade)")
+            logger.info("🔌 Terhubung ke multiple FUTURES streams (Fase 3 + Tracker)")
 
             async def keep_alive():
                 while True:
@@ -439,7 +455,7 @@ async def unified_socket_listener():
 
 # ---------- HTTP Server ----------
 async def health_check(request):
-    return web.Response(text="OK")
+    return web.Response(text="Bot aktif")
 
 async def start_http_server():
     app = web.Application()
@@ -448,56 +464,25 @@ async def start_http_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌐 HTTP server berjalan di port {PORT} untuk health check")
+    logger.info(f"🌐 HTTP server port {PORT}")
 
-# ---------- Fungsi untuk memuat model ----------
-def load_models():
-    global model, hmm_model, hmm_scaler
-    try:
-        model = joblib.load('scalping_model_v1.pkl')
-        logger.info("✅ Model ML v1 berhasil dimuat")
-    except FileNotFoundError:
-        logger.warning("⚠️ Model ML tidak ditemukan, fallback ke strategi sederhana")
-    except Exception as e:
-        logger.error(f"❌ Gagal memuat model ML: {e}")
-
-    try:
-        hmm_model = joblib.load('hmm_model.pkl')
-        hmm_scaler = joblib.load('hmm_scaler.pkl')
-        logger.info("✅ Model HMM untuk deteksi rezim berhasil dimuat")
-    except FileNotFoundError:
-        logger.warning("⚠️ Model HMM tidak ditemukan, deteksi rezim dinonaktifkan")
-    except Exception as e:
-        logger.error(f"❌ Gagal memuat HMM: {e}")
-
-# ---------- Fungsi Utama ----------
+# ---------- Main ----------
 async def main():
-    # 1. Muat model terlebih dahulu
-    load_models()
-
-    # 2. Mulai HTTP server sebagai background task
-    http_server_task = asyncio.create_task(start_http_server())
-    await asyncio.sleep(1)  # Beri waktu server untuk siap
-
-    # 3. Kirim notifikasi startup ke Telegram
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + Statistik Kumulatif"
+            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + Statistik"
         )
     except Exception as e:
-        logger.error(f"Gagal kirim notifikasi startup: {e}")
+        logger.error(f"Startup notify error: {e}")
 
-    # 4. Jalankan WebSocket listener (ini akan berjalan selamanya)
-    try:
-        await unified_socket_listener()
-    except Exception as e:
-        logger.error(f"WebSocket listener error: {e}")
-    finally:
-        http_server_task.cancel()
+    await asyncio.gather(
+        start_http_server(),
+        unified_socket_listener()
+    )
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Bot dihentikan manual")
+        logger.info("🛑 Bot stopped")
