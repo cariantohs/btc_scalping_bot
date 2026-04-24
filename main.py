@@ -2,10 +2,9 @@ import asyncio
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from collections import deque
 
-import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from binance import AsyncClient, BinanceSocketManager
@@ -17,7 +16,6 @@ import ta
 import joblib
 from state_manager import save_state, load_state
 
-# Muat variabel lingkungan
 load_dotenv()
 
 logging.basicConfig(
@@ -44,6 +42,10 @@ current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
 
+# Untuk cooldown sinyal
+last_signal_time: Optional[datetime] = None
+SIGNAL_COOLDOWN_MINUTES = 60  # Minimal jarak antar sinyal (menit)
+
 # ---------- Cache Mikrostruktur ----------
 class MicrostructureCache:
     def __init__(self):
@@ -55,8 +57,13 @@ class MicrostructureCache:
         self.current_candle_cvd: float = 0.0
 
     def update_order_book(self, bids: List[List[str]], asks: List[List[str]]):
-        self.bids = [[float(p), float(q)] for p, q in bids]
-        self.asks = [[float(p), float(q)] for p, q in asks]
+        if not bids or not asks:
+            return
+        try:
+            self.bids = [[float(p), float(q)] for p, q in bids[:20]]
+            self.asks = [[float(p), float(q)] for p, q in asks[:20]]
+        except Exception as e:
+            logger.error(f"Error update order book: {e}")
 
     def add_trade(self, price: float, quantity: float, is_buyer_maker: bool):
         delta = -quantity if is_buyer_maker else quantity
@@ -220,15 +227,38 @@ def get_current_regime_name() -> str:
         return "MENGUMPULKAN DATA..."
     return regime_names.get(current_regime, "UNKNOWN")
 
-# ---------- Strategi ----------
-def generate_signal(df: pd.DataFrame) -> Optional[str]:
+# ---------- Fungsi ATR (untuk TP/SL) ----------
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    if len(df) < period + 1:
+        return 0.0
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    return atr if pd.notna(atr) else 0.0
+
+# ---------- Strategi dengan Filter Ketat ----------
+def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """
+    Menghasilkan sinyal hanya jika kondisi sangat kuat.
+    Returns:
+        signal: 'LONG', 'SHORT', atau None
+        take_profit: harga TP
+        stop_loss: harga SL
+    """
+    global last_signal_time
     selected_model = model
     if selected_model is None or len(df) < 26:
-        return generate_signal_fallback(df)
+        return None, None, None
+
     close = df['close']
     high = df['high']
     low = df['low']
     volume = df['volume']
+    current_price = close.iloc[-1]
+
+    # Hitung fitur
     features = {}
     features['returns_1m'] = close.pct_change().iloc[-1]
     features['returns_5m'] = close.pct_change(5).iloc[-1] if len(close) >= 6 else 0
@@ -242,26 +272,68 @@ def generate_signal(df: pd.DataFrame) -> Optional[str]:
     features['atr'] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
     vol_ma = volume.rolling(20).mean().iloc[-1]
     features['volume_ratio'] = volume.iloc[-1] / vol_ma if vol_ma != 0 else 1.0
+
     feature_order = [
         'returns_1m', 'returns_5m', 'rsi', 'macd', 'macd_signal',
         'bb_high', 'bb_low', 'atr', 'volume_ratio'
     ]
     X = pd.DataFrame([features])[feature_order]
+
     try:
         prob_up = selected_model.predict_proba(X)[0][1]
     except Exception as e:
         logger.error(f"Prediksi error: {e}")
-        return None
-    if prob_up > 0.65:
-        return 'LONG'
-    elif prob_up < 0.35:
-        return 'SHORT'
-    return None
+        return None, None, None
 
-def generate_signal_fallback(df: pd.DataFrame) -> Optional[str]:
+    # ------ FILTER SINYAL ------
+    # 1. Probabilitas sangat tinggi
+    if prob_up < 0.8 and prob_up > 0.2:
+        return None, None, None
+
+    # 2. Konfirmasi tren: alignment dengan EMA 50
+    ema_50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    trend_up = current_price > ema_50
+    trend_down = current_price < ema_50
+
+    signal = None
+    if prob_up > 0.8 and trend_up:
+        signal = 'LONG'
+    elif prob_up < 0.2 and trend_down:
+        signal = 'SHORT'
+
+    if signal is None:
+        return None, None, None
+
+    # 3. Volatilitas cukup (ATR > 0)
+    atr_val = calculate_atr(df)
+    if atr_val <= 0:
+        return None, None, None
+
+    # 4. Cooldown: jangan kirim sinyal jika terlalu dekat dengan sinyal sebelumnya
+    if last_signal_time and (datetime.now() - last_signal_time) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+        logger.info(f"⏳ Sinyal {signal} ditahan karena cooldown.")
+        return None, None, None
+
+    # ------ HITUNG TP/SL ------
+    stop_loss_distance = atr_val * 2.0
+    if signal == 'LONG':
+        stop_loss = current_price - stop_loss_distance
+        take_profit = current_price + (stop_loss_distance * 1.5)  # TP 1.5x SL
+    else:
+        stop_loss = current_price + stop_loss_distance
+        take_profit = current_price - (stop_loss_distance * 1.5)
+
+    last_signal_time = datetime.now()
+    return signal, take_profit, stop_loss
+
+def generate_signal_fallback(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """Fallback dengan indikator teknikal jika model ML tidak tersedia."""
     if len(df) < 26:
-        return None
+        return None, None, None
+
     close = df['close']
+    current_price = close.iloc[-1]
+
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     macd = ta.trend.MACD(close)
     macd_line = macd.macd().iloc[-1]
@@ -269,27 +341,42 @@ def generate_signal_fallback(df: pd.DataFrame) -> Optional[str]:
     bb = ta.volatility.BollingerBands(close, window=20)
     upper = bb.bollinger_hband().iloc[-1]
     lower = bb.bollinger_lband().iloc[-1]
-    price = close.iloc[-1]
-    if rsi < 30 and price <= lower * 1.01:
-        return 'LONG'
-    elif rsi > 70 and price >= upper * 0.99:
-        return 'SHORT'
-    prev_macd = macd.macd().iloc[-2]
-    prev_signal = macd.macd_signal().iloc[-2]
-    if prev_macd < prev_signal and macd_line > signal_line:
-        return 'LONG'
-    elif prev_macd > prev_signal and macd_line < signal_line:
-        return 'SHORT'
-    return None
+    ema_50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+
+    signal = None
+    # Sinyal hanya jika RSI ekstrim dan harga dekat BB dengan konfirmasi tren
+    if rsi < 25 and current_price <= lower * 1.005 and current_price > ema_50:
+        signal = 'LONG'
+    elif rsi > 75 and current_price >= upper * 0.995 and current_price < ema_50:
+        signal = 'SHORT'
+
+    if signal is None:
+        return None, None, None
+
+    atr_val = calculate_atr(df)
+    if atr_val <= 0:
+        return None, None, None
+
+    stop_loss_distance = atr_val * 2.0
+    if signal == 'LONG':
+        stop_loss = current_price - stop_loss_distance
+        take_profit = current_price + (stop_loss_distance * 1.5)
+    else:
+        stop_loss = current_price + stop_loss_distance
+        take_profit = current_price - (stop_loss_distance * 1.5)
+
+    return signal, take_profit, stop_loss
 
 # ---------- Kirim Sinyal + Statistik ----------
-async def send_telegram_signal(signal: str, price: float, additional: str = ""):
+async def send_telegram_signal(signal: str, price: float, tp: float, sl: float, additional: str = ""):
     emoji = "🟢" if signal == "LONG" else "🔴"
     stats = tracker.get_stats()
     message = (
         f"{emoji} <b>SINYAL SCALPING BTCUSDT</b> {emoji}\n"
         f"<b>Aksi:</b> {signal}\n"
-        f"<b>Harga:</b> ${price:,.2f}\n"
+        f"<b>Harga Entry:</b> ${price:,.2f}\n"
+        f"<b>🎯 Take Profit:</b> ${tp:,.2f}\n"
+        f"<b>🛑 Stop Loss:</b> ${sl:,.2f}\n"
         f"<b>Rezim:</b> {get_current_regime_name()}\n"
         f"<b>Waktu:</b> {datetime.now().strftime('%H:%M:%S')}\n"
         f"{additional}\n"
@@ -303,13 +390,13 @@ async def send_telegram_signal(signal: str, price: float, additional: str = ""):
     )
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
-        logger.info(f"📤 Sinyal {signal} dan statistik terkirim ke Telegram")
+        logger.info(f"📤 Sinyal {signal} terkirim")
     except TelegramError as e:
         logger.error(f"Gagal kirim Telegram: {e}")
 
 # ---------- Handler WebSocket ----------
 async def handle_kline(data: Dict):
-    k = data.get('k', data)
+    k = data
     if not k:
         return
     is_closed = k.get('x', False)
@@ -329,7 +416,6 @@ async def handle_kline(data: Dict):
     cache.add_candle(candle)
     logger.info(f"✅ Candle 1m ditutup: {candle['close']:.2f}")
 
-    # Simpan state setiap candle closed
     save_state(cache, tracker, current_regime)
 
     micro_cache.reset_candle_cvd()
@@ -343,20 +429,26 @@ async def handle_kline(data: Dict):
         trade_open_time = tracker.open_trade.timestamp
         if datetime.now() - trade_open_time >= timedelta(minutes=5):
             tracker.close_position(current_price, "time_exit_5m")
-    signal = generate_signal(df)
+
+    # Cek sinyal (gunakan model jika ada, jika tidak fallback)
+    signal, tp, sl = generate_signal(df) if model is not None else (None, None, None)
+    if signal is None:
+        signal, tp, sl = generate_signal_fallback(df)
+
     if signal:
         tracker.open_position(signal, current_price)
         imbalance = micro_cache.get_order_book_imbalance()
         spread = micro_cache.get_spread()
         cvd = micro_cache.current_candle_cvd
         add = f"Imb: {imbalance:.2f} | Spread: {spread:.3f}% | ΔVol: {cvd:.2f}"
-        await send_telegram_signal(signal, current_price, add)
+        await send_telegram_signal(signal, current_price, tp, sl, add)
 
 async def handle_depth(data: Dict):
     bids = data.get('b', [])
     asks = data.get('a', [])
-    if bids and asks:
-        micro_cache.update_order_book(bids, asks)
+    if not bids or not asks:
+        return
+    micro_cache.update_order_book(bids, asks)
 
 async def handle_agg_trade(data: Dict):
     price = float(data.get('p', 0))
@@ -364,58 +456,57 @@ async def handle_agg_trade(data: Dict):
     is_buyer_maker = data.get('m', False)
     micro_cache.add_trade(price, qty, is_buyer_maker)
 
-# ---------- Listener Utama (dengan reconnect loop) ----------
-async def unified_socket_listener():
-    client = None
-    while True:
+# ---------- Listener per stream (dengan perbaikan parsing) ----------
+async def kline_listener():
+    client = await AsyncClient.create()
+    bm = BinanceSocketManager(client)
+    async with bm.futures_socket(symbol='BTCUSDT', interval='1m') as stream:
+        logger.info("🔌 Kline stream terhubung.")
         try:
-            client = await AsyncClient.create()
-            bm = BinanceSocketManager(client)
-            streams = [
-                "btcusdt@kline_1m",
-                "btcusdt@depth20@100ms",
-                "btcusdt@aggTrade"
-            ]
-            async with bm.futures_multiplex_socket(streams) as stream:
-                logger.info("🔌 Terhubung ke multiple FUTURES streams (kline, depth, aggTrade)")
-
-                async def keep_alive():
-                    while True:
-                        await asyncio.sleep(30)
-                        try:
-                            if hasattr(stream, 'socket') and stream.socket:
-                                await stream.socket.ping()
-                        except Exception:
-                            pass
-
-                keep_alive_task = asyncio.create_task(keep_alive())
-
-                try:
-                    while True:
-                        msg = await stream.recv()
-                        stream_name = msg.get('stream', '')
-                        data = msg.get('data', {})
-                        if 'kline' in stream_name:
-                            await handle_kline(data)
-                        elif 'depth20' in stream_name:
-                            await handle_depth(data)
-                        elif 'aggTrade' in stream_name:
-                            await handle_agg_trade(data)
-                        # beri jeda kecil agar tidak memonopoli CPU
-                        await asyncio.sleep(0)
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"Socket error: {e}. Akan reconnect...")
-                finally:
-                    keep_alive_task.cancel()
+            while True:
+                msg = await stream.recv()
+                if 'kline' in msg:
+                    await handle_kline(msg['kline'])
+                else:
+                    logger.debug(f"Kline unexpected: {msg}")
         except Exception as e:
-            logger.error(f"Multiplex connection error: {e}. Mencoba lagi dalam 10 detik...")
-            await asyncio.sleep(10)
+            logger.error(f"Kline socket error: {e}")
         finally:
-            if client:
-                await client.close_connection()
-            await asyncio.sleep(2)  # jeda sebelum reconnect
+            await client.close_connection()
+
+async def depth_listener():
+    client = await AsyncClient.create()
+    bm = BinanceSocketManager(client)
+    async with bm.futures_socket(symbol='BTCUSDT', depth='20') as stream:
+        logger.info("🔌 Depth stream terhubung.")
+        try:
+            while True:
+                msg = await stream.recv()
+                if 'depth' in msg:
+                    await handle_depth(msg['depth'])
+                else:
+                    logger.debug(f"Depth unexpected: {msg}")
+        except Exception as e:
+            logger.error(f"Depth socket error: {e}")
+        finally:
+            await client.close_connection()
+
+async def trade_listener():
+    client = await AsyncClient.create()
+    bm = BinanceSocketManager(client)
+    async with bm.futures_socket(symbol='BTCUSDT') as stream:
+        logger.info("🔌 Trade stream terhubung.")
+        try:
+            while True:
+                msg = await stream.recv()
+                if 'aggTrade' in msg:
+                    await handle_agg_trade(msg['aggTrade'])
+                else:
+                    logger.debug(f"Trade unexpected: {msg}")
+        except Exception as e:
+            logger.error(f"Trade socket error: {e}")
+        finally:
+            await client.close_connection()
 
 # ---------- HTTP Server ----------
 async def health_check(request):
@@ -451,7 +542,6 @@ def load_models():
 # ---------- Main ----------
 async def main():
     load_models()
-    # Muat state sebelumnya
     global current_regime
     saved_regime = load_state(cache, tracker)
     if saved_regime != -1:
@@ -466,12 +556,16 @@ async def main():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + Statistik Kumulatif"
+            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: Paper Trading + TP/SL + Filter Ketat"
         )
     except Exception as e:
         logger.error(f"Gagal kirim notifikasi startup: {e}")
 
-    await unified_socket_listener()
+    await asyncio.gather(
+        kline_listener(),
+        depth_listener(),
+        trade_listener()
+    )
     http_server_task.cancel()
 
 if __name__ == '__main__':
