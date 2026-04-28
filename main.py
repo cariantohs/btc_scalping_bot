@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 from collections import deque
@@ -33,15 +34,30 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Model ----------
+# ---------- Model Management ----------
+MODEL_FILE = 'scalping_model_v2.pkl'
+last_model_mtime = 0
 model = None
 hmm_model = None
 hmm_scaler = None
+
+def reload_model_if_updated():
+    """Muat ulang model jika file .pkl berubah sejak terakhir dimuat."""
+    global model, last_model_mtime
+    try:
+        current_mtime = os.path.getmtime(MODEL_FILE)
+        if current_mtime > last_model_mtime:
+            model = joblib.load(MODEL_FILE)
+            last_model_mtime = current_mtime
+            logger.info("🔄 Model ML diperbarui otomatis dari file terbaru")
+    except Exception as e:
+        logger.error(f"Gagal reload model: {e}")
+
 current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
 last_signal_time: Optional[datetime] = None
-SIGNAL_COOLDOWN_MINUTES = 90   # semakin jarang, semakin bombastis
+SIGNAL_COOLDOWN_MINUTES = 90
 
 # ---------- Cache Mikrostruktur ----------
 class MicrostructureCache:
@@ -248,6 +264,7 @@ def get_current_regime_name() -> str:
 # ---------- Strategi Utama (Model v2, 13 fitur) ----------
 def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     global last_signal_time
+    reload_model_if_updated()   # Auto-reload model jika ada perubahan
     if model is None or len(df) < 60:
         return None, None, None
 
@@ -287,7 +304,7 @@ def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], O
         'atr', 'volume_ratio', 'ema_diff', 'volatility'
     ]
     X = pd.DataFrame([[
-        returns_1m, returns_5m, momentum_5m / 100,   # momentum_5m dalam desimal
+        returns_1m, returns_5m, momentum_5m / 100,
         rsi, macd_val, macd_signal_val,
         bb_high, bb_low, bb_position,
         atr, volume_ratio, ema_diff, volatility
@@ -341,7 +358,7 @@ def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], O
     stop_loss_distance = atr_val * 2.0
     if signal == 'LONG':
         stop_loss = current_price - stop_loss_distance
-        take_profit = current_price + (stop_loss_distance * 2.0)  # TP agresif 2x SL
+        take_profit = current_price + (stop_loss_distance * 2.0)
     else:
         stop_loss = current_price + stop_loss_distance
         take_profit = current_price - (stop_loss_distance * 2.0)
@@ -349,7 +366,6 @@ def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], O
     last_signal_time = datetime.now()
     return signal, take_profit, stop_loss
 
-# Fallback tetap dipertahankan
 def generate_signal_fallback(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     if len(df) < 60:
         return None, None, None
@@ -543,7 +559,7 @@ async def unified_socket_listener():
                         else:
                             logger.debug(f"Stream tidak dikenal: {stream_name}")
 
-                        await asyncio.sleep(0.05)  # Jeda anti-overflow
+                        await asyncio.sleep(0.05)
 
                 except asyncio.CancelledError:
                     pass
@@ -572,11 +588,12 @@ async def start_http_server():
     await site.start()
     logger.info(f"🌐 HTTP server port {PORT}")
 
-# ---------- Muat Model ----------
+# ---------- Muat Model Awal ----------
 def load_models():
-    global model, hmm_model, hmm_scaler
+    global model, hmm_model, hmm_scaler, last_model_mtime
     try:
-        model = joblib.load('scalping_model_v2.pkl')
+        model = joblib.load(MODEL_FILE)
+        last_model_mtime = os.path.getmtime(MODEL_FILE)
         logger.info("✅ Model ML v2 berhasil dimuat")
     except Exception as e:
         logger.error(f"❌ Gagal memuat model ML v2: {e}")
