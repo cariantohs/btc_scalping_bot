@@ -33,7 +33,7 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ---------- Model ML & HMM ----------
+# ---------- Model ----------
 model = None
 hmm_model = None
 hmm_scaler = None
@@ -41,7 +41,7 @@ current_regime = -1
 regime_names = {0: "TRENDING NAIK", 1: "TRENDING TURUN", 2: "RANGING", 3: "VOLATIL"}
 last_regime_update = datetime.now()
 last_signal_time: Optional[datetime] = None
-SIGNAL_COOLDOWN_MINUTES = 60   # Minimal jeda antar sinyal (menit)
+SIGNAL_COOLDOWN_MINUTES = 90   # semakin jarang, semakin bombastis
 
 # ---------- Cache Mikrostruktur ----------
 class MicrostructureCache:
@@ -206,25 +206,23 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     close = df['close']
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(period).mean().iloc[-1]
-    return atr if pd.notna(atr) else 0.0
+    return float(atr) if pd.notna(atr) else 0.0
 
-# ---------- Fungsi Rezim (HMM) ----------
+# ---------- Fungsi Rezim ----------
 def update_market_regime():
     global current_regime, last_regime_update
     if hmm_model is None or hmm_scaler is None:
-        # fallback ke EMA50 jika HMM tidak tersedia
         df = cache.get_dataframe()
         if len(df) >= 50:
             close = df['close']
             ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
             if close.iloc[-1] > ema50:
-                current_regime = 0   # trending naik
+                current_regime = 0
             else:
-                current_regime = 1   # trending turun
+                current_regime = 1
             last_regime_update = datetime.now()
             logger.info(f"🔄 Rezim pasar (EMA): {get_current_regime_name()}")
-        return
-
+            return
     df = cache.get_dataframe()
     if len(df) < 30:
         return
@@ -237,7 +235,7 @@ def update_market_regime():
         return
     latest = df.iloc[-1:][['volatility', 'momentum', 'volume_ratio']].values
     latest_scaled = hmm_scaler.transform(latest)
-    state = hmm_model.predict(latest_scaled)[0]
+    state = int(hmm_model.predict(latest_scaled)[0])
     current_regime = state
     last_regime_update = datetime.now()
     logger.info(f"🔄 Rezim pasar diperbarui: {regime_names.get(state, 'UNKNOWN')} (State {state})")
@@ -247,13 +245,10 @@ def get_current_regime_name() -> str:
         return "MENGUMPULKAN DATA..."
     return regime_names.get(current_regime, "UNKNOWN")
 
-# ---------- Strategi ML dengan Filter Ketat ----------
+# ---------- Strategi Utama (Model v2, 13 fitur) ----------
 def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """
-    Menghasilkan sinyal hanya jika model ML tersedia dan sinyal sangat kuat.
-    """
     global last_signal_time
-    if model is None or len(df) < 26:
+    if model is None or len(df) < 60:
         return None, None, None
 
     close = df['close']
@@ -262,81 +257,107 @@ def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], O
     volume = df['volume']
     current_price = close.iloc[-1]
 
-    # Hitung fitur
-    features = {}
-    features['returns_1m'] = close.pct_change().iloc[-1]
-    features['returns_5m'] = close.pct_change(5).iloc[-1] if len(close) >= 6 else 0
-    features['rsi'] = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+    # Momentum 5 menit minimal 0.3%
+    momentum_5m = (current_price / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+    if abs(momentum_5m) < 0.3:
+        return None, None, None
+
+    # Kumpulkan 13 fitur
+    returns_1m = close.pct_change().iloc[-1]
+    returns_5m = close.pct_change(5).iloc[-1] if len(close) >= 6 else 0
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     macd = ta.trend.MACD(close)
-    features['macd'] = macd.macd().iloc[-1]
-    features['macd_signal'] = macd.macd_signal().iloc[-1]
+    macd_val = macd.macd().iloc[-1]
+    macd_signal_val = macd.macd_signal().iloc[-1]
     bb = ta.volatility.BollingerBands(close, window=20)
-    features['bb_high'] = bb.bollinger_hband().iloc[-1]
-    features['bb_low'] = bb.bollinger_lband().iloc[-1]
-    features['atr'] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
-    vol_ma = volume.rolling(20).mean().iloc[-1]
-    features['volume_ratio'] = volume.iloc[-1] / vol_ma if vol_ma != 0 else 1.0
+    bb_high = bb.bollinger_hband().iloc[-1]
+    bb_low = bb.bollinger_lband().iloc[-1]
+    bb_position = (current_price - bb_low) / (bb_high - bb_low + 1e-9)
+    atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+    volume_ratio = volume.iloc[-1] / volume.rolling(20).mean().iloc[-1] if volume.rolling(20).mean().iloc[-1] != 0 else 1.0
+    ema8 = close.ewm(span=8).mean().iloc[-1]
+    ema21 = close.ewm(span=21).mean().iloc[-1]
+    ema_diff = (ema8 - ema21) / current_price
+    volatility = close.pct_change().rolling(20).std().iloc[-1]
 
     feature_order = [
-        'returns_1m', 'returns_5m', 'rsi', 'macd', 'macd_signal',
-        'bb_high', 'bb_low', 'atr', 'volume_ratio'
+        'returns_1m', 'returns_5m', 'momentum_5m',
+        'rsi', 'macd', 'macd_signal',
+        'bb_high', 'bb_low', 'bb_position',
+        'atr', 'volume_ratio', 'ema_diff', 'volatility'
     ]
-    X = pd.DataFrame([features])[feature_order]
+    X = pd.DataFrame([[
+        returns_1m, returns_5m, momentum_5m / 100,   # momentum_5m dalam desimal
+        rsi, macd_val, macd_signal_val,
+        bb_high, bb_low, bb_position,
+        atr, volume_ratio, ema_diff, volatility
+    ]], columns=feature_order)
 
     try:
-        prob_up = model.predict_proba(X)[0][1]
+        prob_up = float(model.predict_proba(X)[0][1])
     except Exception as e:
         logger.error(f"Prediksi error: {e}")
         return None, None, None
 
-    # ------ FILTER SINYAL ------
-    # 1. Probabilitas sangat tinggi
-    if prob_up < 0.8 and prob_up > 0.2:
+    # Filter bombastis
+    if prob_up < 0.85 and prob_up > 0.15:
         return None, None, None
 
-    # 2. Konfirmasi tren: alignment dengan EMA 50
     ema_50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
     trend_up = current_price > ema_50
     trend_down = current_price < ema_50
 
     signal = None
-    if prob_up > 0.8 and trend_up:
+    if prob_up > 0.85 and trend_up:
         signal = 'LONG'
-    elif prob_up < 0.2 and trend_down:
+    elif prob_up < 0.15 and trend_down:
         signal = 'SHORT'
 
     if signal is None:
         return None, None, None
 
-    # 3. Volatilitas cukup (ATR > 0)
-    atr_val = calculate_atr(df)
-    if atr_val <= 0:
+    # Konfirmasi order book imbalance
+    imbalance = micro_cache.get_order_book_imbalance()
+    if signal == 'LONG' and imbalance <= 0.3:
+        return None, None, None
+    if signal == 'SHORT' and imbalance >= -0.3:
         return None, None, None
 
-    # 4. Cooldown antarsinyal
+    # Filter rezim
+    if current_regime == 0 and signal == 'SHORT':
+        return None, None, None
+    if current_regime == 1 and signal == 'LONG':
+        return None, None, None
+
+    # Cooldown
     if last_signal_time and (datetime.now() - last_signal_time) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
         logger.info(f"⏳ Sinyal {signal} ditahan karena cooldown.")
         return None, None, None
 
-    # ------ HITUNG TP/SL ------
+    atr_val = calculate_atr(df)
+    if atr_val <= 0:
+        return None, None, None
+
     stop_loss_distance = atr_val * 2.0
     if signal == 'LONG':
         stop_loss = current_price - stop_loss_distance
-        take_profit = current_price + (stop_loss_distance * 1.5)  # TP 1.5x SL
+        take_profit = current_price + (stop_loss_distance * 2.0)  # TP agresif 2x SL
     else:
         stop_loss = current_price + stop_loss_distance
-        take_profit = current_price - (stop_loss_distance * 1.5)
+        take_profit = current_price - (stop_loss_distance * 2.0)
 
     last_signal_time = datetime.now()
     return signal, take_profit, stop_loss
 
+# Fallback tetap dipertahankan
 def generate_signal_fallback(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Fallback teknikal jika model ML tidak tersedia."""
-    if len(df) < 50:
+    if len(df) < 60:
         return None, None, None
-
     close = df['close']
     current_price = close.iloc[-1]
+    momentum_5m = (current_price / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+    if abs(momentum_5m) < 0.3:
+        return None, None, None
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     macd = ta.trend.MACD(close)
     macd_line = macd.macd().iloc[-1]
@@ -344,29 +365,29 @@ def generate_signal_fallback(df: pd.DataFrame) -> Tuple[Optional[str], Optional[
     bb = ta.volatility.BollingerBands(close, window=20)
     upper = bb.bollinger_hband().iloc[-1]
     lower = bb.bollinger_lband().iloc[-1]
-    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
 
+    imbalance = micro_cache.get_order_book_imbalance()
     signal = None
-    if rsi < 25 and current_price <= lower * 1.005 and current_price > ema50 and macd_line > signal_line:
+    if rsi < 20 and current_price <= lower and macd_line > signal_line and imbalance > 0.3:
         signal = 'LONG'
-    elif rsi > 75 and current_price >= upper * 0.995 and current_price < ema50 and macd_line < signal_line:
+    elif rsi > 80 and current_price >= upper and macd_line < signal_line and imbalance < -0.3:
         signal = 'SHORT'
-
     if signal is None:
         return None, None, None
-
+    if current_regime == 0 and signal == 'SHORT':
+        return None, None, None
+    if current_regime == 1 and signal == 'LONG':
+        return None, None, None
     atr_val = calculate_atr(df)
     if atr_val <= 0:
         return None, None, None
-
     stop_loss_distance = atr_val * 2.0
     if signal == 'LONG':
         stop_loss = current_price - stop_loss_distance
-        take_profit = current_price + (stop_loss_distance * 1.5)
+        take_profit = current_price + (stop_loss_distance * 2.0)
     else:
         stop_loss = current_price + stop_loss_distance
-        take_profit = current_price - (stop_loss_distance * 1.5)
-
+        take_profit = current_price - (stop_loss_distance * 2.0)
     return signal, take_profit, stop_loss
 
 # ---------- Kirim Sinyal ----------
@@ -416,9 +437,27 @@ async def handle_kline(data: Dict):
         'volume': float(k['v']),
     }
     cache.add_candle(candle)
-    logger.info(f"✅ Candle 1m ditutup: {candle['close']:.2f}")
+    logger.info(f"✅ Candle 1m ditutup: {current_price:.2f}")
 
-    save_state(cache, tracker, current_regime)
+    # Simpan state dengan konversi native Python
+    try:
+        state_regime = int(current_regime)
+        state_wins = int(tracker.wins)
+        state_losses = int(tracker.losses)
+        state_pnl = float(tracker.total_pnl_pct)
+        clean_candles = []
+        for c in cache.candles:
+            clean_candles.append({
+                'timestamp': int(c['timestamp']),
+                'open': float(c['open']),
+                'high': float(c['high']),
+                'low': float(c['low']),
+                'close': float(c['close']),
+                'volume': float(c['volume'])
+            })
+        save_state(clean_candles, state_wins, state_losses, state_pnl, state_regime)
+    except Exception as e:
+        logger.error(f"Gagal menyimpan state: {e}")
 
     micro_cache.reset_candle_cvd()
     global last_regime_update
@@ -434,7 +473,6 @@ async def handle_kline(data: Dict):
         if datetime.now() - trade_open_time >= timedelta(minutes=5):
             tracker.close_position(current_price, "time_exit_5m")
 
-    # Cek sinyal (gunakan ML jika tersedia, jika tidak fallback)
     signal, tp, sl = generate_signal(df) if model is not None else (None, None, None)
     if signal is None:
         signal, tp, sl = generate_signal_fallback(df)
@@ -448,11 +486,10 @@ async def handle_kline(data: Dict):
         await send_telegram_signal(signal, current_price, tp, sl, add)
 
 async def handle_depth(data: Dict):
-    bids = data.get('b', [])
-    asks = data.get('a', [])
-    if not bids or not asks:
-        return
-    micro_cache.update_order_book(bids, asks)
+    bids = data.get('bids', [])
+    asks = data.get('asks', [])
+    if bids and asks:
+        micro_cache.update_order_book(bids, asks)
 
 async def handle_agg_trade(data: Dict):
     price = float(data.get('p', 0))
@@ -460,7 +497,7 @@ async def handle_agg_trade(data: Dict):
     is_buyer_maker = data.get('m', False)
     micro_cache.add_trade(price, qty, is_buyer_maker)
 
-# ---------- Listener Utama (Multiplex) ----------
+# ---------- Listener Utama ----------
 async def unified_socket_listener():
     client = None
     while True:
@@ -493,13 +530,12 @@ async def unified_socket_listener():
                         data = msg.get('data', {})
 
                         if 'kline' in stream_name:
-                            # format multiplex: data ada di dalam 'data', tetapi data['kline'] ada
                             if 'kline' in data:
                                 await handle_kline(data['kline'])
-                            elif 'k' in data:   # kadang ada format berbeda
+                            elif 'k' in data:
                                 await handle_kline(data['k'])
                             else:
-                                logger.debug(f"Kline data unexpected: {data}")
+                                logger.debug(f"Kline unexpected: {data}")
                         elif 'depth' in stream_name:
                             await handle_depth(data)
                         elif 'aggTrade' in stream_name:
@@ -507,8 +543,7 @@ async def unified_socket_listener():
                         else:
                             logger.debug(f"Stream tidak dikenal: {stream_name}")
 
-                        # Beri sedikit jeda untuk mencegah overload CPU
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(0.05)  # Jeda anti-overflow
 
                 except asyncio.CancelledError:
                     pass
@@ -541,10 +576,10 @@ async def start_http_server():
 def load_models():
     global model, hmm_model, hmm_scaler
     try:
-        model = joblib.load('scalping_model_v1.pkl')
-        logger.info("✅ Model ML v1 berhasil dimuat")
+        model = joblib.load('scalping_model_v2.pkl')
+        logger.info("✅ Model ML v2 berhasil dimuat")
     except Exception as e:
-        logger.error(f"❌ Gagal memuat model ML: {e}")
+        logger.error(f"❌ Gagal memuat model ML v2: {e}")
         model = None
     try:
         hmm_model = joblib.load('hmm_model.pkl')
@@ -572,7 +607,7 @@ async def main():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: ML + TP/SL + Filter Ketat"
+            text=f"🚀 Bot Scalping FUTURES aktif!\nRezim: {get_current_regime_name()}\nMode: ML v2 Bombastis + Online Learning"
         )
     except Exception as e:
         logger.error(f"Gagal kirim notifikasi startup: {e}")
