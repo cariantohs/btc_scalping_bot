@@ -212,7 +212,19 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
 def update_market_regime():
     global current_regime, last_regime_update
     if hmm_model is None or hmm_scaler is None:
+        # fallback ke EMA50 jika HMM tidak tersedia
+        df = cache.get_dataframe()
+        if len(df) >= 50:
+            close = df['close']
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            if close.iloc[-1] > ema50:
+                current_regime = 0   # trending naik
+            else:
+                current_regime = 1   # trending turun
+            last_regime_update = datetime.now()
+            logger.info(f"🔄 Rezim pasar (EMA): {get_current_regime_name()}")
         return
+
     df = cache.get_dataframe()
     if len(df) < 30:
         return
@@ -239,10 +251,6 @@ def get_current_regime_name() -> str:
 def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     """
     Menghasilkan sinyal hanya jika model ML tersedia dan sinyal sangat kuat.
-    Returns:
-        signal: 'LONG', 'SHORT', atau None
-        take_profit: harga TP
-        stop_loss: harga SL
     """
     global last_signal_time
     if model is None or len(df) < 26:
@@ -305,7 +313,7 @@ def generate_signal(df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], O
     if atr_val <= 0:
         return None, None, None
 
-    # 4. Cooldown
+    # 4. Cooldown antarsinyal
     if last_signal_time and (datetime.now() - last_signal_time) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
         logger.info(f"⏳ Sinyal {signal} ditahan karena cooldown.")
         return None, None, None
@@ -452,57 +460,69 @@ async def handle_agg_trade(data: Dict):
     is_buyer_maker = data.get('m', False)
     micro_cache.add_trade(price, qty, is_buyer_maker)
 
-# ---------- Listener per stream ----------
-async def kline_listener():
-    client = await AsyncClient.create()
-    bm = BinanceSocketManager(client)
-    async with bm.futures_socket(symbol='BTCUSDT', interval='1m') as stream:
-        logger.info("🔌 Kline stream terhubung.")
+# ---------- Listener Utama (Multiplex) ----------
+async def unified_socket_listener():
+    client = None
+    while True:
         try:
-            while True:
-                msg = await stream.recv()
-                if 'kline' in msg:
-                    await handle_kline(msg['kline'])
-                else:
-                    logger.debug(f"Kline unexpected: {msg}")
-        except Exception as e:
-            logger.error(f"Kline socket error: {e}")
-        finally:
-            await client.close_connection()
+            client = await AsyncClient.create()
+            bm = BinanceSocketManager(client)
+            streams = [
+                "btcusdt@kline_1m",
+                "btcusdt@depth20@100ms",
+                "btcusdt@aggTrade"
+            ]
+            async with bm.futures_multiplex_socket(streams) as stream:
+                logger.info("🔌 Terhubung ke multiple FUTURES streams (kline, depth, aggTrade)")
 
-async def depth_listener():
-    client = await AsyncClient.create()
-    bm = BinanceSocketManager(client)
-    async with bm.futures_socket(symbol='BTCUSDT', depth='20') as stream:
-        logger.info("🔌 Depth stream terhubung.")
-        try:
-            while True:
-                msg = await stream.recv()
-                if 'depth' in msg:
-                    await handle_depth(msg['depth'])
-                else:
-                    logger.debug(f"Depth unexpected: {msg}")
-        except Exception as e:
-            logger.error(f"Depth socket error: {e}")
-        finally:
-            await client.close_connection()
+                async def keep_alive():
+                    while True:
+                        await asyncio.sleep(30)
+                        try:
+                            if hasattr(stream, 'socket') and stream.socket:
+                                await stream.socket.ping()
+                        except Exception:
+                            pass
 
-async def trade_listener():
-    client = await AsyncClient.create()
-    bm = BinanceSocketManager(client)
-    async with bm.futures_socket(symbol='BTCUSDT') as stream:
-        logger.info("🔌 Trade stream terhubung.")
-        try:
-            while True:
-                msg = await stream.recv()
-                if 'aggTrade' in msg:
-                    await handle_agg_trade(msg['aggTrade'])
-                else:
-                    logger.debug(f"Trade unexpected: {msg}")
+                keep_alive_task = asyncio.create_task(keep_alive())
+
+                try:
+                    while True:
+                        msg = await stream.recv()
+                        stream_name = msg.get('stream', '')
+                        data = msg.get('data', {})
+
+                        if 'kline' in stream_name:
+                            # format multiplex: data ada di dalam 'data', tetapi data['kline'] ada
+                            if 'kline' in data:
+                                await handle_kline(data['kline'])
+                            elif 'k' in data:   # kadang ada format berbeda
+                                await handle_kline(data['k'])
+                            else:
+                                logger.debug(f"Kline data unexpected: {data}")
+                        elif 'depth' in stream_name:
+                            await handle_depth(data)
+                        elif 'aggTrade' in stream_name:
+                            await handle_agg_trade(data)
+                        else:
+                            logger.debug(f"Stream tidak dikenal: {stream_name}")
+
+                        # Beri sedikit jeda untuk mencegah overload CPU
+                        await asyncio.sleep(0)
+
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Socket error: {e}. Akan reconnect...")
+                finally:
+                    keep_alive_task.cancel()
         except Exception as e:
-            logger.error(f"Trade socket error: {e}")
+            logger.error(f"Multiplex connection error: {e}. Mencoba lagi dalam 10 detik...")
+            await asyncio.sleep(10)
         finally:
-            await client.close_connection()
+            if client:
+                await client.close_connection()
+            await asyncio.sleep(2)
 
 # ---------- HTTP Server ----------
 async def health_check(request):
@@ -557,11 +577,7 @@ async def main():
     except Exception as e:
         logger.error(f"Gagal kirim notifikasi startup: {e}")
 
-    await asyncio.gather(
-        kline_listener(),
-        depth_listener(),
-        trade_listener()
-    )
+    await unified_socket_listener()
     http_server_task.cancel()
 
 if __name__ == '__main__':
