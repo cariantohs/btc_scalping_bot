@@ -3,16 +3,16 @@ import os
 import logging
 
 STATE_FILE = "bot_state.json"
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def save_state(cache, tracker, current_regime):
+def save_state(candles, wins, losses, total_pnl, regime):
+    """Simpan state dengan parameter yang sudah dikonversi ke tipe native Python."""
     state = {
-        'cache_candles': cache.candles,
-        'tracker_wins': tracker.wins,
-        'tracker_losses': tracker.losses,
-        'tracker_total_pnl_pct': tracker.total_pnl_pct,
-        'current_regime': current_regime
+        'cache_candles': candles,
+        'tracker_wins': int(wins),
+        'tracker_losses': int(losses),
+        'tracker_total_pnl_pct': float(total_pnl),
+        'current_regime': int(regime)
     }
     try:
         with open(STATE_FILE, 'w') as f:
