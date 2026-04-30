@@ -18,7 +18,6 @@ import ta
 import joblib
 from sklearn.preprocessing import StandardScaler
 
-# Coba impor TensorFlow – jika gagal, model LSTM dinonaktifkan
 try:
     import tensorflow as tf
     HAS_TF = True
@@ -53,7 +52,6 @@ scaler     = None
 
 def load_models():
     global model_lstm, model_lgb, scaler
-    # --- LSTM ---
     if HAS_TF and os.path.exists(MODEL_LSTM_PATH):
         try:
             model_lstm = tf.keras.models.load_model(MODEL_LSTM_PATH)
@@ -63,14 +61,12 @@ def load_models():
     else:
         logger.warning("⚠️ TensorFlow tidak tersedia atau model LSTM tidak ditemukan – fallback ke LightGBM")
 
-    # --- LightGBM ---
     try:
         model_lgb = joblib.load(MODEL_LGB_PATH)
         logger.info("✅ Model LightGBM (direction) dimuat")
     except Exception as e:
         logger.error(f"❌ Gagal memuat LightGBM: {e}")
 
-    # --- Scaler ---
     try:
         scaler = joblib.load(SCALER_PATH)
         logger.info("✅ Scaler dimuat")
@@ -148,14 +144,13 @@ losses = 0
 total_pnl = 0.0
 open_trade = None   # {'signal', 'entry', 'bars_held'}
 
-# Muat state tersimpan
 seq, wins, losses, total_pnl, open_trade_state = load_state()
 cache.feature_seq = deque(seq, maxlen=20)
 if open_trade_state:
     open_trade = {
         'signal': open_trade_state['signal'],
         'entry': open_trade_state['entry'],
-        'bars_held': 0   # reset saat restart
+        'bars_held': 0
     }
 
 def close_trade(exit_price, reason):
@@ -175,7 +170,6 @@ def check_open_trade(current_price):
     global open_trade
     if open_trade is None:
         return
-    # Trailing stop 0.15 %
     trailing_pct = 0.15
     if open_trade['signal'] == 'LONG':
         if current_price <= open_trade['entry'] * (1 - trailing_pct / 100):
@@ -185,7 +179,7 @@ def check_open_trade(current_price):
             close_trade(current_price, 'trailing_stop')
     if open_trade:
         open_trade['bars_held'] += 1
-        if open_trade['bars_held'] >= 5:   # exit setelah 5 candle 3m (15 menit)
+        if open_trade['bars_held'] >= 5:
             close_trade(current_price, 'time_exit_5bars')
 
 # ================== FITUR ==================
@@ -221,28 +215,33 @@ def compute_features(df):
     }
     return pd.DataFrame([[features[col] for col in FEATURE_COLS]], columns=FEATURE_COLS)
 
-# ================== SINYAL ==================
+# ================== SINYAL + LOG ANALISIS ==================
 LAST_SIGNAL_TIME = None
-SIGNAL_COOLDOWN_MINUTES = 75   # 1.25 jam antar sinyal
+SIGNAL_COOLDOWN_MINUTES = 75
 
 def generate_signal():
     global LAST_SIGNAL_TIME, open_trade
     if model_lgb is None or scaler is None:
+        logger.info("⏳ Model belum siap")
         return None
 
     df3  = cache.get_dataframe('3m')
     df15 = cache.get_dataframe('15m')
-    if len(df3) < 30 or len(df15) < 20:
+    if len(df3) < 30:
+        logger.info("⏳ Data 3m belum cukup (butuh minimal 30 candle)")
+        return None
+    if len(df15) < 20:
+        logger.info("⏳ Data 15m belum cukup (butuh minimal 20 candle)")
         return None
 
     X = compute_features(df3)
     if X is None:
+        logger.info("⏳ Gagal menghitung fitur")
         return None
 
-    # Simpan fitur ke sequence untuk LSTM
     cache.feature_seq.append(X.iloc[0].tolist())
 
-    # ---- Deteksi Momentum ----
+    # Deteksi momentum
     if model_lstm is not None and len(cache.feature_seq) >= 20:
         seq_arr = np.array([list(cache.feature_seq)[-20:]])
         prob_momentum = float(model_lstm.predict(seq_arr, verbose=0)[0][0])
@@ -250,35 +249,39 @@ def generate_signal():
         X_scaled = scaler.transform(X)
         prob_momentum = float(model_lgb.predict_proba(X_scaled)[0][1]) if model_lgb else 0.0
 
-    logger.info(f"Prob momentum: {prob_momentum:.4f}")
+    logger.info(f"🔍 Prob momentum: {prob_momentum:.4f} (threshold: 0.8)")
+
     if prob_momentum < 0.8:
+        logger.info("❌ Sinyal TIDAK dihasilkan: prob momentum di bawah threshold")
         return None
 
-    # ---- Penentu Arah ----
+    # Penentu arah
     X_scaled = scaler.transform(X)
-    pred_direction = int(model_lgb.predict(X_scaled)[0])   # 1 atau -1
+    pred_direction = int(model_lgb.predict(X_scaled)[0])
     signal = 'LONG' if pred_direction == 1 else 'SHORT'
+    logger.info(f"➡️ Arah terdeteksi: {signal}")
 
-    # ---- Filter Tren 15m ----
+    # Filter tren 15m
     sma_15 = df15['close'].rolling(20).mean().iloc[-1]
     trend_15_up = df15['close'].iloc[-1] > sma_15
     if signal == 'LONG' and not trend_15_up:
-        logger.info("Sinyal LONG ditolak: tren 15m turun")
+        logger.info("❌ Sinyal DITOLAK: LONG tapi tren 15m sedang turun")
         return None
     if signal == 'SHORT' and trend_15_up:
-        logger.info("Sinyal SHORT ditolak: tren 15m naik")
+        logger.info("❌ Sinyal DITOLAK: SHORT tapi tren 15m sedang naik")
         return None
 
-    # ---- Cooldown ----
+    # Cooldown
     now = datetime.now()
     if LAST_SIGNAL_TIME and (now - LAST_SIGNAL_TIME) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
-        logger.info("Sinyal ditahan – cooldown")
-        return None
-    if open_trade is not None:
-        logger.info("Masih ada trade terbuka, abaikan sinyal baru")
+        logger.info("❌ Sinyal DITAHAN: cooldown aktif")
         return None
 
-    # ---- TP / SL ----
+    if open_trade is not None:
+        logger.info("❌ Sinyal DITAHAN: masih ada posisi terbuka")
+        return None
+
+    # TP / SL
     atr_val = ta.volatility.AverageTrueRange(df3['high'], df3['low'], df3['close'], 14).average_true_range().iloc[-1]
     sl_dist = atr_val * 2.0
     cur_price = df3['close'].iloc[-1]
@@ -290,6 +293,7 @@ def generate_signal():
         tp = cur_price - sl_dist * 2.5
 
     LAST_SIGNAL_TIME = now
+    logger.info(f"✅ SINYAL DIHASILKAN: {signal} | Entry: {cur_price:.2f} | TP: {tp:.2f} | SL: {sl:.2f}")
     return signal, tp, sl
 
 # ================== KIRIM TELEGRAM ==================
@@ -312,7 +316,7 @@ async def send_telegram_signal(signal, price, tp, sl):
     )
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
-        logger.info(f"📤 Sinyal {signal} terkirim")
+        logger.info(f"📤 Sinyal {signal} terkirim ke Telegram")
     except TelegramError as e:
         logger.error(f"Gagal kirim Telegram: {e}")
 
@@ -320,7 +324,7 @@ async def send_telegram_signal(signal, price, tp, sl):
 async def listener():
     global open_trade
     client = None
-    backoff = 1                     # detik, maksimal 60
+    backoff = 1
 
     while True:
         try:
@@ -360,7 +364,7 @@ async def listener():
                             if 'kline_3m' in stream_name:
                                 cache.add_candle('3m', candle)
                                 cur_price = candle['close']
-                                logger.info(f"3m close: {cur_price:.2f}")
+                                logger.info(f"─── 3m close: {cur_price:.2f} ───")
 
                                 if open_trade:
                                     check_open_trade(cur_price)
@@ -374,8 +378,10 @@ async def listener():
                                         'bars_held': 0
                                     }
                                     await send_telegram_signal(signal, cur_price, tp, sl)
+                                else:
+                                    logger.info("ℹ️ Tidak ada sinyal yang memenuhi kriteria")
 
-                                # Simpan state setiap candle 3m
+                                # Simpan state
                                 trade_info = {'signal': open_trade['signal'], 'entry': open_trade['entry']} if open_trade else None
                                 save_state(list(cache.feature_seq), wins, losses, total_pnl, trade_info)
 
@@ -399,7 +405,7 @@ async def listener():
         except Exception as e:
             logger.error(f"Koneksi gagal: {e}. Reconnect dalam {backoff} detik...")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)   # exponential backoff
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 try:
