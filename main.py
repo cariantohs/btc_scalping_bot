@@ -2,6 +2,7 @@ import asyncio
 import os
 import logging
 import json
+import time as _time
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional, Dict, List, Tuple
@@ -17,7 +18,7 @@ import ta
 import joblib
 from sklearn.preprocessing import StandardScaler
 
-# TensorFlow hanya diimpor jika model LSTM digunakan
+# Coba impor TensorFlow – jika gagal, model LSTM dinonaktifkan
 try:
     import tensorflow as tf
     HAS_TF = True
@@ -32,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 PORT = int(os.getenv('PORT', 8080))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -43,15 +44,16 @@ bot = Bot(token=TELEGRAM_TOKEN)
 
 # ================== MODEL ==================
 MODEL_LSTM_PATH = 'scalping_lstm_entry.h5'
-MODEL_LGB_PATH = 'scalping_direction_lgb.pkl'
-SCALER_PATH = 'scaler_v3.pkl'
+MODEL_LGB_PATH  = 'scalping_direction_lgb.pkl'
+SCALER_PATH     = 'scaler_v3.pkl'
 
 model_lstm = None
-model_lgb = None
-scaler = None
+model_lgb  = None
+scaler     = None
 
 def load_models():
     global model_lstm, model_lgb, scaler
+    # --- LSTM ---
     if HAS_TF and os.path.exists(MODEL_LSTM_PATH):
         try:
             model_lstm = tf.keras.models.load_model(MODEL_LSTM_PATH)
@@ -59,14 +61,16 @@ def load_models():
         except Exception as e:
             logger.error(f"❌ Gagal memuat LSTM: {e}")
     else:
-        logger.warning("⚠️ TensorFlow tidak tersedia atau model LSTM tidak ditemukan")
+        logger.warning("⚠️ TensorFlow tidak tersedia atau model LSTM tidak ditemukan – fallback ke LightGBM")
 
+    # --- LightGBM ---
     try:
         model_lgb = joblib.load(MODEL_LGB_PATH)
         logger.info("✅ Model LightGBM (direction) dimuat")
     except Exception as e:
         logger.error(f"❌ Gagal memuat LightGBM: {e}")
 
+    # --- Scaler ---
     try:
         scaler = joblib.load(SCALER_PATH)
         logger.info("✅ Scaler dimuat")
@@ -76,13 +80,13 @@ def load_models():
 # ================== STATE MANAGER ==================
 STATE_FILE = 'bot_state_v3.json'
 
-def save_state(sequence, wins, losses, total_pnl, open_trade):
+def save_state(sequence, wins, losses, total_pnl, open_trade_info):
     state = {
-        'sequence': sequence,
-        'wins': wins,
-        'losses': losses,
-        'total_pnl': total_pnl,
-        'open_trade': open_trade
+        'sequence': list(sequence),
+        'wins': int(wins),
+        'losses': int(losses),
+        'total_pnl': float(total_pnl),
+        'open_trade': open_trade_info
     }
     try:
         with open(STATE_FILE, 'w') as f:
@@ -105,14 +109,13 @@ def load_state():
         logger.error(f"Gagal memuat state: {e}")
         return [], 0, 0, 0.0, None
 
-# ================== CACHE & TRACKER ==================
+# ================== CACHE MULTI‑TIMEFRAME ==================
 class MultiCache:
     def __init__(self):
         self.candles_3m = deque(maxlen=60)
         self.candles_15m = deque(maxlen=40)
         self.candles_1h = deque(maxlen=20)
-        # Sequence fitur untuk LSTM (20 elemen terakhir)
-        self.feature_seq = deque(maxlen=20)
+        self.feature_seq = deque(maxlen=20)   # 20 elemen terakhir untuk LSTM
 
     def add_candle(self, tf, candle):
         if tf == '3m':
@@ -139,15 +142,52 @@ class MultiCache:
 
 cache = MultiCache()
 
-# Statistik & paper trading
+# ================== PAPER TRADING & STATISTIK ==================
 wins = 0
 losses = 0
 total_pnl = 0.0
-open_trade = None   # {'signal', 'entry', 'timestamp', 'bars_held'}
+open_trade = None   # {'signal', 'entry', 'bars_held'}
 
-# Muat state sebelumnya
-seq, wins, losses, total_pnl, open_trade = load_state()
+# Muat state tersimpan
+seq, wins, losses, total_pnl, open_trade_state = load_state()
 cache.feature_seq = deque(seq, maxlen=20)
+if open_trade_state:
+    open_trade = {
+        'signal': open_trade_state['signal'],
+        'entry': open_trade_state['entry'],
+        'bars_held': 0   # reset saat restart
+    }
+
+def close_trade(exit_price, reason):
+    global open_trade, wins, losses, total_pnl
+    if open_trade is None:
+        return
+    pnl = ((exit_price - open_trade['entry']) / open_trade['entry'] * 100) if open_trade['signal'] == 'LONG' else ((open_trade['entry'] - exit_price) / open_trade['entry'] * 100)
+    if pnl > 0:
+        wins += 1
+    else:
+        losses += 1
+    total_pnl += pnl
+    logger.info(f"📊 Paper trade closed: {open_trade['signal']} PnL {pnl:.3f}% ({reason})")
+    open_trade = None
+
+def check_open_trade(current_price):
+    global open_trade
+    if open_trade is None:
+        return
+    # Trailing stop 0.15 %
+    trailing_pct = 0.15
+    if open_trade['signal'] == 'LONG':
+        if current_price <= open_trade['entry'] * (1 - trailing_pct / 100):
+            close_trade(current_price, 'trailing_stop')
+    else:
+        if current_price >= open_trade['entry'] * (1 + trailing_pct / 100):
+            close_trade(current_price, 'trailing_stop')
+    if open_trade:
+        open_trade['bars_held'] += 1
+        if open_trade['bars_held'] >= 5:   # exit setelah 5 candle 3m (15 menit)
+            close_trade(current_price, 'time_exit_5bars')
+
 # ================== FITUR ==================
 FEATURE_COLS = [
     'returns', 'volatility', 'body_ratio', 'high_low_ratio',
@@ -182,46 +222,44 @@ def compute_features(df):
     return pd.DataFrame([[features[col] for col in FEATURE_COLS]], columns=FEATURE_COLS)
 
 # ================== SINYAL ==================
-def generate_signal():
-    global open_trade, wins, losses, total_pnl
+LAST_SIGNAL_TIME = None
+SIGNAL_COOLDOWN_MINUTES = 75   # 1.25 jam antar sinyal
 
+def generate_signal():
+    global LAST_SIGNAL_TIME, open_trade
     if model_lgb is None or scaler is None:
         return None
 
-    df3 = cache.get_dataframe('3m')
+    df3  = cache.get_dataframe('3m')
     df15 = cache.get_dataframe('15m')
     if len(df3) < 30 or len(df15) < 20:
         return None
 
-    # Hitung fitur candle terbaru
     X = compute_features(df3)
     if X is None:
         return None
 
-    # Tambahkan ke sequence (untuk LSTM)
+    # Simpan fitur ke sequence untuk LSTM
     cache.feature_seq.append(X.iloc[0].tolist())
 
-    # Jika model LSTM tersedia dan sequence cukup, gunakan LSTM
+    # ---- Deteksi Momentum ----
     if model_lstm is not None and len(cache.feature_seq) >= 20:
-        # Bentuk input (1, 20, 10)
         seq_arr = np.array([list(cache.feature_seq)[-20:]])
-        prob_momentum = model_lstm.predict(seq_arr, verbose=0)[0][0]
+        prob_momentum = float(model_lstm.predict(seq_arr, verbose=0)[0][0])
     else:
-        # Fallback: gunakan LightGBM langsung untuk mendeteksi momentum (probabilitas kelas 1)
         X_scaled = scaler.transform(X)
-        prob_momentum = model_lgb.predict_proba(X_scaled)[0][1] if model_lgb else 0
+        prob_momentum = float(model_lgb.predict_proba(X_scaled)[0][1]) if model_lgb else 0.0
 
     logger.info(f"Prob momentum: {prob_momentum:.4f}")
-
-    if prob_momentum < 0.8:    # threshold ketat
+    if prob_momentum < 0.8:
         return None
 
-    # ---- Model B: penentu arah ----
+    # ---- Penentu Arah ----
     X_scaled = scaler.transform(X)
-    pred_direction = model_lgb.predict(X_scaled)[0]   # 1 atau -1
+    pred_direction = int(model_lgb.predict(X_scaled)[0])   # 1 atau -1
     signal = 'LONG' if pred_direction == 1 else 'SHORT'
 
-    # ---- Filter tren 15m ----
+    # ---- Filter Tren 15m ----
     sma_15 = df15['close'].rolling(20).mean().iloc[-1]
     trend_15_up = df15['close'].iloc[-1] > sma_15
     if signal == 'LONG' and not trend_15_up:
@@ -232,26 +270,30 @@ def generate_signal():
         return None
 
     # ---- Cooldown ----
+    now = datetime.now()
+    if LAST_SIGNAL_TIME and (now - LAST_SIGNAL_TIME) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+        logger.info("Sinyal ditahan – cooldown")
+        return None
     if open_trade is not None:
         logger.info("Masih ada trade terbuka, abaikan sinyal baru")
         return None
 
-    # ---- TP/SL (ATR 2.5x) ----
-    atr = ta.volatility.AverageTrueRange(df3['high'], df3['low'], df3['close'], 14).average_true_range().iloc[-1]
-    sl_distance = atr * 2.0
+    # ---- TP / SL ----
+    atr_val = ta.volatility.AverageTrueRange(df3['high'], df3['low'], df3['close'], 14).average_true_range().iloc[-1]
+    sl_dist = atr_val * 2.0
     cur_price = df3['close'].iloc[-1]
     if signal == 'LONG':
-        sl = cur_price - sl_distance
-        tp = cur_price + sl_distance * 2.5
+        sl = cur_price - sl_dist
+        tp = cur_price + sl_dist * 2.5
     else:
-        sl = cur_price + sl_distance
-        tp = cur_price - sl_distance * 2.5
+        sl = cur_price + sl_dist
+        tp = cur_price - sl_dist * 2.5
 
+    LAST_SIGNAL_TIME = now
     return signal, tp, sl
 
 # ================== KIRIM TELEGRAM ==================
 async def send_telegram_signal(signal, price, tp, sl):
-    global wins, losses, total_pnl
     total = wins + losses
     wr = (wins / total * 100) if total > 0 else 0.0
     emoji = "🟢" if signal == "LONG" else "🔴"
@@ -274,54 +316,22 @@ async def send_telegram_signal(signal, price, tp, sl):
     except TelegramError as e:
         logger.error(f"Gagal kirim Telegram: {e}")
 
-# ================== PAPER TRADING ==================
-def check_open_trade(current_price):
-    global open_trade, wins, losses, total_pnl
-    if open_trade is None:
-        return
-
-    open_trade['bars_held'] += 1
-    # Exit setelah 5 candle 3m (15 menit) atau trailing stop 0.15%
-    exit_bars = 5
-    signal = open_trade['signal']
-    entry = open_trade['entry']
-
-    # Trailing stop 0.15% dari harga saat ini
-    trailing_stop = 0.15
-    if signal == 'LONG':
-        if current_price <= entry * (1 - trailing_stop / 100):
-            close_trade(current_price, "trailing stop")
-            return
-    else:
-        if current_price >= entry * (1 + trailing_stop / 100):
-            close_trade(current_price, "trailing stop")
-            return
-
-    if open_trade['bars_held'] >= exit_bars:
-        close_trade(current_price, "time exit")
-
-def close_trade(exit_price, reason):
-    global open_trade, wins, losses, total_pnl
-    pnl = ((exit_price - open_trade['entry']) / open_trade['entry'] * 100) if open_trade['signal'] == 'LONG' else ((open_trade['entry'] - exit_price) / open_trade['entry'] * 100)
-    if pnl > 0:
-        wins += 1
-    else:
-        losses += 1
-    total_pnl += pnl
-    logger.info(f"📊 Paper trade closed: {open_trade['signal']} PnL {pnl:.3f}% ({reason})")
-    open_trade = None
-
-# ================== LISTENER ==================
+# ================== LISTENER TANGGUH ==================
 async def listener():
     global open_trade
     client = None
+    backoff = 1                     # detik, maksimal 60
+
     while True:
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
             streams = ["btcusdt@kline_3m", "btcusdt@kline_15m", "btcusdt@kline_1h"]
+
             async with bm.futures_multiplex_socket(streams) as stream:
                 logger.info("🔌 Terhubung ke FUTURES streams (3m, 15m, 1h)")
+                backoff = 1
+
                 async def keep_alive():
                     while True:
                         await asyncio.sleep(30)
@@ -329,6 +339,7 @@ async def listener():
                             if hasattr(stream, 'socket') and stream.socket:
                                 await stream.socket.ping()
                         except: pass
+
                 keep_alive_task = asyncio.create_task(keep_alive())
 
                 try:
@@ -349,33 +360,52 @@ async def listener():
                             if 'kline_3m' in stream_name:
                                 cache.add_candle('3m', candle)
                                 cur_price = candle['close']
-                                # Update trailing stop & paper trading
+                                logger.info(f"3m close: {cur_price:.2f}")
+
                                 if open_trade:
                                     check_open_trade(cur_price)
-                                # Cek sinyal
+
                                 res = generate_signal()
                                 if res:
                                     signal, tp, sl = res
-                                    # Buka trade baru
-                                    open_trade = {'signal': signal, 'entry': cur_price, 'timestamp': datetime.now(), 'bars_held': 0}
+                                    open_trade = {
+                                        'signal': signal,
+                                        'entry': cur_price,
+                                        'bars_held': 0
+                                    }
                                     await send_telegram_signal(signal, cur_price, tp, sl)
-                                # Simpan state
-                                save_state(list(cache.feature_seq), wins, losses, total_pnl, open_trade)
+
+                                # Simpan state setiap candle 3m
+                                trade_info = {'signal': open_trade['signal'], 'entry': open_trade['entry']} if open_trade else None
+                                save_state(list(cache.feature_seq), wins, losses, total_pnl, trade_info)
+
                             elif 'kline_15m' in stream_name:
                                 cache.add_candle('15m', candle)
                             elif 'kline_1h' in stream_name:
                                 cache.add_candle('1h', candle)
-                        await asyncio.sleep(0)
+
+                        await asyncio.sleep(0.01)
+
+                except asyncio.CancelledError:
+                    logger.info("Listener dibatalkan")
+                    break
                 except Exception as e:
-                    logger.error(f"Stream inner error: {e}")
+                    logger.error(f"Stream error: {e}")
                 finally:
                     keep_alive_task.cancel()
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Connection error: {e}. Reconnecting in 10s...")
-            await asyncio.sleep(10)
+            logger.error(f"Koneksi gagal: {e}. Reconnect dalam {backoff} detik...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)   # exponential backoff
         finally:
             if client:
-                await client.close_connection()
+                try:
+                    await client.close_connection()
+                except: pass
+            await asyncio.sleep(1)
 
 # ================== HTTP HEALTH CHECK ==================
 async def health(request):
@@ -394,7 +424,10 @@ async def start_http():
 async def main():
     load_models()
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 V3 Scalping Bot aktif (LSTM+LightGBM, 3m/15m/1h)")
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="🚀 V3 Scalper Tangguh aktif! (LSTM+LightGBM, auto‑reconnect, state persistent)"
+        )
     except: pass
 
     await asyncio.gather(start_http(), listener())
