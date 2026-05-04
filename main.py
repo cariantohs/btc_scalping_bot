@@ -12,7 +12,8 @@ from telegram import Bot
 from telegram.error import TelegramError
 import ta
 import joblib
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import tensorflow as tf
 
 load_dotenv()
 
@@ -26,28 +27,32 @@ PORT = int(os.getenv('PORT', 8080))
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # ================== MODEL ==================
-MODEL_PATH = 'scalping_ensemble_v4.pkl'
-SCALER_PATH = 'scaler_v4.pkl'
+MODEL_PATH = 'scalping_lstm_v4.h5'
+SCALER_STATIC_PATH = 'scaler_static.pkl'
+SCALER_SEQ_PATH = 'scaler_seq.pkl'
+
 model = None
-scaler = None
+scaler_static = None
+scaler_seq = None
 
 def load_models():
-    global model, scaler
+    global model, scaler_static, scaler_seq
     try:
-        model = joblib.load(MODEL_PATH)
-        logger.info("✅ Ensemble model v4 dimuat")
+        model = tf.keras.models.load_model(MODEL_PATH)
+        logger.info("✅ Model LSTM v4 dimuat")
     except Exception as e:
-        logger.error(f"❌ Gagal memuat model: {e}")
+        logger.error(f"❌ Gagal memuat model LSTM: {e}")
     try:
-        scaler = joblib.load(SCALER_PATH)
-        logger.info("✅ Scaler v4 dimuat")
+        scaler_static = joblib.load(SCALER_STATIC_PATH)
+        scaler_seq = joblib.load(SCALER_SEQ_PATH)
+        logger.info("✅ Scaler dimuat")
     except Exception as e:
         logger.error(f"❌ Gagal memuat scaler: {e}")
 
 # ================== CACHE ==================
 class Cache:
     def __init__(self):
-        self.candles_5m = deque(maxlen=100)
+        self.candles_5m = deque(maxlen=100)   # candle mentah
         self.candles_15m = deque(maxlen=60)
         self.candles_1h = deque(maxlen=30)
 
@@ -77,7 +82,7 @@ wins = losses = 0
 total_pnl = 0.0
 open_trade = None
 LAST_SIGNAL = None
-COOLDOWN = timedelta(hours=3)   # Sinyal maksimal ~8 per hari, idealnya 1-3
+COOLDOWN = timedelta(hours=3)
 
 # ================== FITUR ==================
 FEATS = [
@@ -117,7 +122,7 @@ def compute_features(df):
 # ================== SINYAL ==================
 def generate_signal():
     global LAST_SIGNAL, open_trade
-    if model is None or scaler is None:
+    if model is None or scaler_static is None or scaler_seq is None:
         logger.info("Model belum siap")
         return None
 
@@ -127,21 +132,33 @@ def generate_signal():
         logger.info("Data belum cukup")
         return None
 
-    X = compute_features(df5)
-    if X is None:
+    # Fitur statis dari candle terbaru
+    X_static = compute_features(df5)
+    if X_static is None:
         return None
 
-    # --- Probabilitas Ensemble ---
-    X_s = scaler.transform(X)
-    prob_up = model.predict_proba(X_s)[0][1]   # prob LONG
-    prob_down = model.predict_proba(X_s)[0][0] # prob SHORT
+    # Data sekuensial: 20 candle terakhir sebelum candle saat ini
+    if len(cache.candles_5m) < 20:
+        logger.info("Belum cukup candle untuk sequence LSTM")
+        return None
+    seq_raw = []
+    for c in list(cache.candles_5m)[-20:]:
+        seq_raw.append([c['open'], c['high'], c['low'], c['close'], c['volume']])
+    X_seq = np.array([seq_raw])
+    X_seq_scaled = np.array([scaler_seq.transform(X_seq[0])])
 
-    logger.info(f"Prob LONG: {prob_up:.3f} | Prob SHORT: {prob_down:.3f}")
+    X_static_scaled = scaler_static.transform(X_static)
+
+    # Prediksi probabilitas LONG
+    prob_long = model.predict([X_seq_scaled, X_static_scaled], verbose=0)[0][0]
+    prob_short = 1 - prob_long
+
+    logger.info(f"Prob LONG: {prob_long:.3f} | Prob SHORT: {prob_short:.3f}")
 
     # Threshold sangat tinggi
-    if prob_up > 0.85:
+    if prob_long > 0.85:
         signal = 'LONG'
-    elif prob_down > 0.85:
+    elif prob_short > 0.85:
         signal = 'SHORT'
     else:
         logger.info("Probabilitas tidak cukup tinggi")
@@ -184,7 +201,7 @@ def generate_signal():
     sl_dist = atr_val * 2.0
     if signal == 'LONG':
         sl = cur - sl_dist
-        tp = cur + sl_dist * 2.0   # RR 1:2
+        tp = cur + sl_dist * 2.0
     else:
         sl = cur + sl_dist
         tp = cur - sl_dist * 2.0
@@ -217,7 +234,6 @@ def update_trade(cur_price):
     global open_trade, wins, losses, total_pnl
     if not open_trade:
         return
-    # Trailing stop 0.3%
     if open_trade['signal'] == 'LONG':
         if cur_price <= open_trade['entry'] * (1 - 0.3/100):
             close_trade(cur_price, 'trailing')
@@ -228,7 +244,6 @@ def update_trade(cur_price):
             close_trade(cur_price, 'trailing')
         elif cur_price <= open_trade['entry'] * (1 - 0.6/100):
             close_trade(cur_price, 'take_profit_hit')
-    # Time exit 30 menit
     if open_trade and (datetime.now() - open_trade['time']).seconds > 1800:
         close_trade(cur_price, 'time_exit')
 
@@ -315,7 +330,7 @@ async def start_http():
 
 async def main():
     load_models()
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 V4 Scalper Super Ketat aktif!")
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 V4 Hybrid LSTM aktif!")
     await asyncio.gather(start_http(), listener())
 
 if __name__ == '__main__':
