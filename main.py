@@ -357,165 +357,123 @@ def close_trade(price, reason):
     logger.info(f"📊 Trade closed: {open_trade['signal']} PnL {pnl:.3f}% ({reason})")
     open_trade = None
 
-# ================== LISTENER TERPISAH (DIPERBAIKI) ==================
-async def kline_5m_listener():
+# ================== UNIFIED LISTENER (MULTIPLEX) ==================
+async def unified_socket_listener():
+    client = None
     backoff = 1
     while True:
-        client = None
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='5m') as stream:
-                logger.info("🔌 Kline 5m terhubung")
+            streams = [
+                "btcusdt@kline_5m",
+                "btcusdt@kline_15m",
+                "btcusdt@kline_1h",
+                "btcusdt@depth20@100ms",
+                "btcusdt@aggTrade"
+            ]
+            async with bm.futures_multiplex_socket(streams) as stream:
+                logger.info("🔌 Multiplex terhubung (5m,15m,1h,depth,trade)")
                 backoff = 1
-                while True:
-                    msg = await stream.recv()
-                    k = msg.get('k', msg)
-                    if k and k.get('x'):
-                        candle = {
-                            'timestamp': k['t'],
-                            'open': float(k['o']),
-                            'high': float(k['h']),
-                            'low': float(k['l']),
-                            'close': float(k['c']),
-                            'volume': float(k['v'])
-                        }
-                        cache.add('5m', candle)
-                        cur = candle['close']
-                        logger.info(f"5m close: {cur:.2f}")
-                        order_cache.reset_candle()
-                        update_trade(cur)
-                        res = generate_signal()
-                        if res:
-                            signal, tp, sl = res
-                            open_trade = {'signal': signal, 'entry': cur, 'time': now_wib()}
-                            await send_telegram(signal, cur, tp, sl)
-                    await asyncio.sleep(0.01)
-        except Exception as e:
-            logger.error(f"Kline 5m error: {e}. Reconnect {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        finally:
-            if client:
-                await client.close_connection()
 
-async def kline_15m_listener():
-    backoff = 1
-    while True:
-        client = None
-        try:
-            client = await AsyncClient.create()
-            bm = BinanceSocketManager(client)
-            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='15m') as stream:
-                logger.info("🔌 Kline 15m terhubung")
-                backoff = 1
-                while True:
-                    msg = await stream.recv()
-                    k = msg.get('k', msg)
-                    if k and k.get('x'):
-                        candle = {
-                            'timestamp': k['t'],
-                            'open': float(k['o']),
-                            'high': float(k['h']),
-                            'low': float(k['l']),
-                            'close': float(k['c']),
-                            'volume': float(k['v'])
-                        }
-                        cache.add('15m', candle)
-                    await asyncio.sleep(0.01)
-        except Exception as e:
-            logger.error(f"Kline 15m error: {e}. Reconnect {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        finally:
-            if client:
-                await client.close_connection()
+                async def keep_alive():
+                    while True:
+                        await asyncio.sleep(30)
+                        try:
+                            if hasattr(stream, 'socket') and stream.socket:
+                                await stream.socket.ping()
+                        except:
+                            pass
 
-async def kline_1h_listener():
-    backoff = 1
-    while True:
-        client = None
-        try:
-            client = await AsyncClient.create()
-            bm = BinanceSocketManager(client)
-            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='1h') as stream:
-                logger.info("🔌 Kline 1h terhubung")
-                backoff = 1
-                while True:
-                    msg = await stream.recv()
-                    k = msg.get('k', msg)
-                    if k and k.get('x'):
-                        candle = {
-                            'timestamp': k['t'],
-                            'open': float(k['o']),
-                            'high': float(k['h']),
-                            'low': float(k['l']),
-                            'close': float(k['c']),
-                            'volume': float(k['v'])
-                        }
-                        cache.add('1h', candle)
-                    await asyncio.sleep(0.01)
-        except Exception as e:
-            logger.error(f"Kline 1h error: {e}. Reconnect {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        finally:
-            if client:
-                await client.close_connection()
+                keep_alive_task = asyncio.create_task(keep_alive())
 
-async def depth_listener():
-    backoff = 1
-    while True:
-        client = None
-        try:
-            client = await AsyncClient.create()
-            bm = BinanceSocketManager(client)
-            async with bm.depth_futures_socket(symbol='BTCUSDT', speed='100ms') as stream:
-                logger.info("🔌 Depth terhubung")
-                backoff = 1
-                while True:
-                    msg = await stream.recv()
-                    data = msg.get('data', msg)
-                    bids = data.get('bids', data.get('b', []))
-                    asks = data.get('asks', data.get('a', []))
-                    if bids and asks:
-                        order_cache.update_depth(bids, asks)
-                    await asyncio.sleep(0.01)
-        except Exception as e:
-            logger.error(f"Depth error: {e}. Reconnect {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        finally:
-            if client:
-                await client.close_connection()
+                try:
+                    while True:
+                        msg = await stream.recv()
+                        stream_name = msg.get('stream', '')
+                        data = msg.get('data', {})
 
-async def trade_listener():
-    backoff = 1
-    while True:
-        client = None
-        try:
-            client = await AsyncClient.create()
-            bm = BinanceSocketManager(client)
-            async with bm.aggtrade_futures_socket(symbol='BTCUSDT') as stream:
-                logger.info("🔌 Trade terhubung")
-                backoff = 1
-                while True:
-                    msg = await stream.recv()
-                    data = msg.get('data', msg)
-                    if 'p' in data and 'q' in data:
-                        order_cache.add_trade(
-                            float(data['p']),
-                            float(data['q']),
-                            data.get('m', False)
-                        )
-                    await asyncio.sleep(0.01)
+                        # --- Kline 5m ---
+                        if 'kline_5m' in stream_name:
+                            k = data.get('k', data)
+                            if k and k.get('x'):
+                                candle = {
+                                    'timestamp': k['t'],
+                                    'open': float(k['o']),
+                                    'high': float(k['h']),
+                                    'low': float(k['l']),
+                                    'close': float(k['c']),
+                                    'volume': float(k['v'])
+                                }
+                                cache.add('5m', candle)
+                                cur = candle['close']
+                                logger.info(f"5m close: {cur:.2f}")
+                                order_cache.reset_candle()
+                                update_trade(cur)
+                                res = generate_signal()
+                                if res:
+                                    signal, tp, sl = res
+                                    open_trade = {'signal': signal, 'entry': cur, 'time': now_wib()}
+                                    await send_telegram(signal, cur, tp, sl)
+
+                        # --- Kline 15m ---
+                        elif 'kline_15m' in stream_name:
+                            k = data.get('k', data)
+                            if k and k.get('x'):
+                                candle = {
+                                    'timestamp': k['t'],
+                                    'open': float(k['o']),
+                                    'high': float(k['h']),
+                                    'low': float(k['l']),
+                                    'close': float(k['c']),
+                                    'volume': float(k['v'])
+                                }
+                                cache.add('15m', candle)
+
+                        # --- Kline 1h ---
+                        elif 'kline_1h' in stream_name:
+                            k = data.get('k', data)
+                            if k and k.get('x'):
+                                candle = {
+                                    'timestamp': k['t'],
+                                    'open': float(k['o']),
+                                    'high': float(k['h']),
+                                    'low': float(k['l']),
+                                    'close': float(k['c']),
+                                    'volume': float(k['v'])
+                                }
+                                cache.add('1h', candle)
+
+                        # --- Depth ---
+                        elif 'depth' in stream_name:
+                            bids = data.get('bids', data.get('b', []))
+                            asks = data.get('asks', data.get('a', []))
+                            if bids and asks:
+                                order_cache.update_depth(bids, asks)
+
+                        # --- Trade ---
+                        elif 'aggTrade' in stream_name:
+                            price = float(data.get('p', 0))
+                            qty = float(data.get('q', 0))
+                            is_buyer_maker = data.get('m', False)
+                            order_cache.add_trade(price, qty, is_buyer_maker)
+
+                        # Jeda pentinya – cegah overflow
+                        await asyncio.sleep(0.01)
+
+                except Exception as e:
+                    logger.error(f"Stream error: {e}")
+                finally:
+                    keep_alive_task.cancel()
+
         except Exception as e:
-            logger.error(f"Trade error: {e}. Reconnect {backoff}s...")
+            logger.error(f"Koneksi gagal: {e}. Reconnect {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
+            await asyncio.sleep(1)
 
 # ================== HTTP HEALTH CHECK ==================
 async def health(request):
@@ -533,17 +491,13 @@ async def start_http():
 # ================== MAIN ==================
 async def main():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Scalping v4 aktif! (5m,15m,1h,OB,WIB)")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Scalping v4 aktif! (Multiplex, WIB)")
     except:
         pass
 
     await asyncio.gather(
         start_http(),
-        kline_5m_listener(),
-        kline_15m_listener(),
-        kline_1h_listener(),
-        depth_listener(),
-        trade_listener()
+        unified_socket_listener()
     )
 
 if __name__ == '__main__':
