@@ -222,15 +222,21 @@ def compute_features(df):
 def generate_signal():
     global LAST_SIGNAL, open_trade
     if lgb is None:
+        logger.info("⏳ Model LightGBM belum dimuat")
         return None
 
     df5 = cache.df('5m')
     df15 = cache.df('15m')
-    if len(df5) < 30 or len(df15) < 20:
+    if len(df5) < 30:
+        logger.info(f"⏳ Data 5m belum cukup ({len(df5)}/30)")
+        return None
+    if len(df15) < 20:
+        logger.info(f"⏳ Data 15m belum cukup ({len(df15)}/20)")
         return None
 
     X_static = compute_features(df5)
     if X_static is None:
+        logger.info("⏳ Gagal menghitung fitur")
         return None
 
     votes_long, votes_short = 0, 0
@@ -239,57 +245,87 @@ def generate_signal():
     try:
         prob_long = lgb.predict_proba(X_static)[0][1]
         prob_short = 1 - prob_long
-        logger.info(f"Prob LONG: {prob_long:.4f} | Prob SHORT: {prob_short:.4f}")
+        logger.info(f"🔍 Prob LONG: {prob_long:.4f} | Prob SHORT: {prob_short:.4f}")
         if prob_long > 0.85:
             votes_long += 1
+            logger.info("✅ LightGBM vote LONG")
         elif prob_short > 0.85:
             votes_short += 1
+            logger.info("✅ LightGBM vote SHORT")
+        else:
+            logger.info("❌ Probabilitas LightGBM tidak cukup tinggi (<0.85)")
     except Exception as e:
-        logger.error(f"LightGBM error: {e}")
+        logger.error(f"❌ LightGBM error: {e}")
         return None
 
     # ----- xLSTM (jika tersedia) -----
     if xlstm and scaler_xlstm and len(cache.candles_5m) >= 15:
-        # xLSTM belum diintegrasikan sepenuhnya karena perlu scaler yang sesuai
+        logger.info("ℹ️ xLSTM tersedia tapi belum diintegrasikan")
         pass
+    else:
+        if xlstm is None:
+            logger.info("ℹ️ xLSTM tidak tersedia")
+        elif len(cache.candles_5m) < 15:
+            logger.info(f"⏳ Candle 5m untuk xLSTM belum cukup ({len(cache.candles_5m)}/15)")
 
     # ----- Voting -----
     signal = None
     if votes_long >= 1 and votes_short == 0:
         signal = 'LONG'
+        logger.info("📊 Voting: LONG")
     elif votes_short >= 1 and votes_long == 0:
         signal = 'SHORT'
+        logger.info("📊 Voting: SHORT")
     else:
-        logger.info(f"Votes tidak cukup: L={votes_long} S={votes_short}")
+        logger.info(f"❌ Voting tidak cukup: LONG={votes_long}, SHORT={votes_short}")
         return None
 
     # ----- Filter Order Book -----
     imbalance = order_cache.get_imbalance()
-    if signal == 'LONG' and (order_cache.candle_cvd < 0 or imbalance < 0.2):
-        logger.info(f"LONG ditolak OB: CVD={order_cache.candle_cvd:.2f} Imb={imbalance:.2f}")
-        return None
-    if signal == 'SHORT' and (order_cache.candle_cvd > 0 or imbalance > -0.2):
-        logger.info(f"SHORT ditolak OB: CVD={order_cache.candle_cvd:.2f} Imb={imbalance:.2f}")
-        return None
+    cvd = order_cache.candle_cvd
+    logger.info(f"📚 Order Book: CVD={cvd:.2f}, Imbalance={imbalance:.2f}")
+    if signal == 'LONG':
+        if cvd < 0:
+            logger.info("❌ LONG ditolak: CVD negatif (tekanan jual)")
+            return None
+        if imbalance < 0.2:
+            logger.info(f"❌ LONG ditolak: Imbalance terlalu rendah ({imbalance:.2f} < 0.2)")
+            return None
+    elif signal == 'SHORT':
+        if cvd > 0:
+            logger.info("❌ SHORT ditolak: CVD positif (tekanan beli)")
+            return None
+        if imbalance > -0.2:
+            logger.info(f"❌ SHORT ditolak: Imbalance terlalu tinggi ({imbalance:.2f} > -0.2)")
+            return None
+    logger.info("✅ Filter Order Book lolos")
 
     # ----- Filter Tren 15m -----
     sma15 = df15['close'].rolling(20).mean().iloc[-1]
     trend15_up = df15['close'].iloc[-1] > sma15
+    logger.info(f"📈 Tren 15m: {'NAIK' if trend15_up else 'TURUN'} (Close={df15['close'].iloc[-1]:.2f}, SMA20={sma15:.2f})")
     if signal == 'LONG' and not trend15_up:
-        logger.info("LONG ditolak tren 15m")
+        logger.info("❌ LONG ditolak: Tren 15m sedang turun")
         return None
     if signal == 'SHORT' and trend15_up:
-        logger.info("SHORT ditolak tren 15m")
+        logger.info("❌ SHORT ditolak: Tren 15m sedang naik")
         return None
+    logger.info("✅ Filter Tren 15m lolos")
 
     # ----- Cooldown -----
     now = now_wib()
-    if LAST_SIGNAL and (now - LAST_SIGNAL) < COOLDOWN:
-        logger.info("Cooldown aktif")
-        return None
+    if LAST_SIGNAL:
+        cooldown_left = COOLDOWN - (now - LAST_SIGNAL)
+        if cooldown_left > timedelta(0):
+            logger.info(f"⏳ Cooldown aktif ({int(cooldown_left.total_seconds()/60)} menit lagi)")
+            return None
+    logger.info("✅ Cooldown lolos")
+
+    # ----- Posisi Terbuka -----
     if open_trade:
-        logger.info("Sudah ada posisi terbuka")
+        logger.info("❌ Masih ada posisi terbuka, sinyal baru diabaikan")
         return None
+    logger.info("✅ Tidak ada posisi terbuka")
 
     # ----- TP/SL -----
     cur = df5['close'].iloc[-1]
@@ -303,7 +339,7 @@ def generate_signal():
         tp = cur - sl_dist * 2.0
 
     LAST_SIGNAL = now
-    logger.info(f"✅ SINYAL {signal} | Entry: {cur:.2f} TP: {tp:.2f} SL: {sl:.2f}")
+    logger.info(f"✅ SINYAL {signal} DIKIRIM | Entry: {cur:.2f} TP: {tp:.2f} SL: {sl:.2f}")
     return signal, tp, sl
 
 # ================== TELEGRAM ==================
@@ -458,7 +494,7 @@ async def unified_socket_listener():
                             is_buyer_maker = data.get('m', False)
                             order_cache.add_trade(price, qty, is_buyer_maker)
 
-                        # Jeda pentinya – cegah overflow
+                        # Jeda cegah overflow
                         await asyncio.sleep(0.01)
 
                 except Exception as e:
@@ -500,8 +536,4 @@ async def main():
         unified_socket_listener()
     )
 
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot dihentikan")
+if 
