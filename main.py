@@ -1,7 +1,7 @@
 import asyncio
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional, Dict, List, Tuple
 
@@ -18,6 +18,12 @@ import ta
 import joblib
 from sklearn.preprocessing import StandardScaler
 
+# ================== ZONA WAKTU WIB ==================
+WIB = timezone(timedelta(hours=7))
+
+def now_wib():
+    return datetime.now(tz=WIB)
+
 # ================== KONFIGURASI ==================
 load_dotenv()
 
@@ -32,7 +38,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 PORT = int(os.getenv('PORT', 8080))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di-set")
+    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di‑set")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -43,20 +49,20 @@ MODEL_LGB_PATH = 'scalping_ensemble_v4.pkl'
 
 device = torch.device('cpu')
 
-# ================== LOAD MODELS ==================
+# ================== MUAT MODEL ==================
 xlstm = None
 scaler_xlstm = None
 lgb = None
 
-# ----- LightGBM -----
+# ----- LightGBM (wajib) -----
 if os.path.exists(MODEL_LGB_PATH):
-    try:
-        lgb = joblib.load(MODEL_LGB_PATH)
-        logger.info("✅ LightGBM dimuat")
-    except Exception as e:
-        logger.error(f"Gagal memuat LightGBM: {e}")
+    lgb = joblib.load(MODEL_LGB_PATH)
+    logger.info("✅ LightGBM dimuat")
+else:
+    logger.error("❌ LightGBM tidak ditemukan. Bot tidak bisa berjalan.")
+    exit(1)
 
-# ----- xLSTM (jika tersedia) -----
+# ----- xLSTM (opsional) -----
 if os.path.exists(MODEL_XLSTM_PATH) and os.path.exists(SCALER_XLSTM_PATH):
     try:
         from xlstm import (
@@ -109,9 +115,11 @@ if os.path.exists(MODEL_XLSTM_PATH) and os.path.exists(SCALER_XLSTM_PATH):
         scaler_xlstm = joblib.load(SCALER_XLSTM_PATH)
         logger.info("✅ xLSTM & scaler dimuat")
     except Exception as e:
-        logger.error(f"Gagal memuat xLSTM: {e}")
+        logger.warning(f"⚠️ xLSTM tidak bisa dimuat: {e}. Hanya LightGBM yang aktif.")
+        xlstm = None
+        scaler_xlstm = None
 
-# ================== CACHE ==================
+# ================== ORDER BOOK & CACHE ==================
 class OrderFlowCache:
     def __init__(self):
         self.bids = []
@@ -231,6 +239,7 @@ def generate_signal():
     try:
         prob_long = lgb.predict_proba(X_static)[0][1]
         prob_short = 1 - prob_long
+        logger.info(f"Prob LONG: {prob_long:.4f} | Prob SHORT: {prob_short:.4f}")
         if prob_long > 0.85:
             votes_long += 1
         elif prob_short > 0.85:
@@ -242,15 +251,8 @@ def generate_signal():
     # ----- xLSTM (jika tersedia) -----
     if xlstm and scaler_xlstm and len(cache.candles_5m) >= 15:
         try:
-            # Ambil 15 candle terakhir, hitung fitur untuk setiap candle
-            sub_df = df5.iloc[-15:]
-            feat_list = []
-            for i in range(len(sub_df)):
-                sub_slice = sub_df.iloc[:i+1]
-                # Untuk setiap candle kita perlu fitur yang konteksnya minimal 30 candle, ini sulit.
-                # Pendekatan praktis: gunakan fitur statis dari candle terbaru dan gunakan xLSTM sebagai model stateless
-                # Karena keterbatasan, kita skip xLSTM untuk saat ini jika belum ada scaler yang tepat
-                pass
+            # Sementara tidak digunakan – akan disempurnakan setelah scaler fix
+            pass
         except Exception as e:
             logger.error(f"xLSTM error: {e}")
 
@@ -284,7 +286,7 @@ def generate_signal():
         return None
 
     # ----- Cooldown -----
-    now = datetime.now()
+    now = now_wib()
     if LAST_SIGNAL and (now - LAST_SIGNAL) < COOLDOWN:
         logger.info("Cooldown aktif")
         return None
@@ -318,7 +320,7 @@ async def send_telegram(signal, price, tp, sl):
         f"<b>Harga Entry:</b> ${price:,.2f}\n"
         f"<b>🎯 Take Profit:</b> ${tp:,.2f}\n"
         f"<b>🛑 Stop Loss:</b> ${sl:,.2f}\n"
-        f"<b>Waktu:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+        f"<b>Waktu:</b> {now_wib().strftime('%H:%M:%S')} WIB\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"Total Trades: {total}\n"
         f"Win Rate: {wr:.1f}%\n"
@@ -327,7 +329,7 @@ async def send_telegram(signal, price, tp, sl):
     )
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
-# ================== TRADE MANAGEMENT ==================
+# ================== MANAJEMEN TRADE ==================
 def update_trade(cur_price):
     global open_trade, wins, losses, total_pnl
     if not open_trade:
@@ -342,7 +344,7 @@ def update_trade(cur_price):
             close_trade(cur_price, 'trailing')
         elif cur_price <= open_trade['entry'] * (1 - 0.6/100):
             close_trade(cur_price, 'take_profit')
-    if open_trade and (datetime.now() - open_trade['time']).seconds > 1800:
+    if open_trade and (now_wib() - open_trade['time']).seconds > 1800:
         close_trade(cur_price, 'time_exit')
 
 def close_trade(price, reason):
@@ -360,7 +362,7 @@ def close_trade(price, reason):
 
 # ================== LISTENER TERPISAH ==================
 async def kline_5m_listener():
-    reconnect_delay = 1
+    backoff = 1
     while True:
         client = None
         try:
@@ -368,7 +370,7 @@ async def kline_5m_listener():
             bm = BinanceSocketManager(client)
             async with bm.futures_socket(symbol='BTCUSDT', interval='5m') as stream:
                 logger.info("🔌 Kline 5m terhubung")
-                reconnect_delay = 1
+                backoff = 1
                 while True:
                     msg = await stream.recv()
                     k = msg.get('k', msg)
@@ -389,19 +391,19 @@ async def kline_5m_listener():
                         res = generate_signal()
                         if res:
                             signal, tp, sl = res
-                            open_trade = {'signal': signal, 'entry': cur, 'time': datetime.now()}
+                            open_trade = {'signal': signal, 'entry': cur, 'time': now_wib()}
                             await send_telegram(signal, cur, tp, sl)
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.error(f"Kline 5m error: {e}. Reconnect {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            logger.error(f"Kline 5m error: {e}. Reconnect {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
 
 async def kline_15m_listener():
-    reconnect_delay = 1
+    backoff = 1
     while True:
         client = None
         try:
@@ -409,7 +411,7 @@ async def kline_15m_listener():
             bm = BinanceSocketManager(client)
             async with bm.futures_socket(symbol='BTCUSDT', interval='15m') as stream:
                 logger.info("🔌 Kline 15m terhubung")
-                reconnect_delay = 1
+                backoff = 1
                 while True:
                     msg = await stream.recv()
                     k = msg.get('k', msg)
@@ -425,15 +427,15 @@ async def kline_15m_listener():
                         cache.add('15m', candle)
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.error(f"Kline 15m error: {e}. Reconnect {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            logger.error(f"Kline 15m error: {e}. Reconnect {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
 
 async def kline_1h_listener():
-    reconnect_delay = 1
+    backoff = 1
     while True:
         client = None
         try:
@@ -441,7 +443,7 @@ async def kline_1h_listener():
             bm = BinanceSocketManager(client)
             async with bm.futures_socket(symbol='BTCUSDT', interval='1h') as stream:
                 logger.info("🔌 Kline 1h terhubung")
-                reconnect_delay = 1
+                backoff = 1
                 while True:
                     msg = await stream.recv()
                     k = msg.get('k', msg)
@@ -457,15 +459,15 @@ async def kline_1h_listener():
                         cache.add('1h', candle)
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.error(f"Kline 1h error: {e}. Reconnect {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            logger.error(f"Kline 1h error: {e}. Reconnect {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
 
 async def depth_listener():
-    reconnect_delay = 1
+    backoff = 1
     while True:
         client = None
         try:
@@ -473,7 +475,7 @@ async def depth_listener():
             bm = BinanceSocketManager(client)
             async with bm.futures_socket(symbol='BTCUSDT', depth='20') as stream:
                 logger.info("🔌 Depth terhubung")
-                reconnect_delay = 1
+                backoff = 1
                 while True:
                     msg = await stream.recv()
                     data = msg.get('data', msg)
@@ -483,15 +485,15 @@ async def depth_listener():
                         order_cache.update_depth(bids, asks)
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.error(f"Depth error: {e}. Reconnect {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            logger.error(f"Depth error: {e}. Reconnect {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
 
 async def trade_listener():
-    reconnect_delay = 1
+    backoff = 1
     while True:
         client = None
         try:
@@ -499,7 +501,7 @@ async def trade_listener():
             bm = BinanceSocketManager(client)
             async with bm.futures_socket(symbol='BTCUSDT') as stream:
                 logger.info("🔌 Trade terhubung")
-                reconnect_delay = 1
+                backoff = 1
                 while True:
                     msg = await stream.recv()
                     data = msg.get('data', msg)
@@ -511,9 +513,9 @@ async def trade_listener():
                         )
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.error(f"Trade error: {e}. Reconnect {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            logger.error(f"Trade error: {e}. Reconnect {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         finally:
             if client:
                 await client.close_connection()
@@ -534,6 +536,21 @@ async def start_http():
 # ================== MAIN ==================
 async def main():
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Scalping v4 aktif! (5m,15m,1h,OB)")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Scalping v4 aktif! (5m,15m,1h,OB,WIB)")
     except:
-     
+        pass
+
+    await asyncio.gather(
+        start_http(),
+        kline_5m_listener(),
+        kline_15m_listener(),
+        kline_1h_listener(),
+        depth_listener(),
+        trade_listener()
+    )
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot dihentikan")
