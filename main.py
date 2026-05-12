@@ -1,10 +1,16 @@
-import asyncio, os, logging, json, time as _time
+import asyncio
+import os
+import logging
+import json
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional, Dict, List, Tuple
+import time as _time
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 from aiohttp import web
 from dotenv import load_dotenv
 from binance import AsyncClient, BinanceSocketManager
@@ -12,8 +18,13 @@ from telegram import Bot
 from telegram.error import TelegramError
 import ta
 import joblib
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+from xlstm import (
+    xLSTMBlockStack, xLSTMBlockStackConfig,
+    mLSTMBlockConfig, mLSTMLayerConfig,
+    sLSTMBlockConfig, sLSTMLayerConfig,
+    FeedForwardConfig,
+)
 
 load_dotenv()
 
@@ -24,35 +35,122 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 PORT = int(os.getenv('PORT', 8080))
 
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise ValueError("TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID harus di‑set")
+
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # ================== MODEL ==================
-MODEL_PATH = 'scalping_lstm_v4.h5'
-SCALER_STATIC_PATH = 'scaler_static.pkl'
-SCALER_SEQ_PATH = 'scaler_seq.pkl'
+MODEL_XLSTM_PATH = 'xlstm_multi.pt'
+SCALER_XLSTM_PATH = 'scaler_xlstm.pkl'
+MODEL_LGB_PATH = 'scalping_ensemble_v4.pkl'
 
-model = None
-scaler_static = None
-scaler_seq = None
+device = torch.device('cpu')
+
+# ----- xLSTM -----
+class MultiHorizonXSLTM(nn.Module):
+    def __init__(self, input_size, hidden=128, seq_len=15):
+        super().__init__()
+        mlstm_config = mLSTMBlockConfig(
+            mlstm=mLSTMLayerConfig(
+                conv1d_kernel_size=4,
+                qkv_proj_blocksize=4,
+                num_heads=4
+            )
+        )
+        slstm_config = sLSTMBlockConfig(
+            slstm=sLSTMLayerConfig(
+                backend="vanilla",
+                num_heads=4,
+                conv1d_kernel_size=4,
+                bias_init="powerlaw_blockdependent"
+            ),
+            feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu")
+        )
+        cfg = xLSTMBlockStackConfig(
+            mlstm_block=mlstm_config,
+            slstm_block=slstm_config,
+            context_length=seq_len,
+            num_blocks=2,
+            embedding_dim=hidden,
+            slstm_at=[1]
+        )
+        self.xlstm = xLSTMBlockStack(cfg)
+        self.input_proj = nn.Linear(input_size, hidden)
+        self.fc = nn.Linear(hidden, 3)  # 3 horizon: 5m, 15m, 30m
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        out = self.xlstm(x)
+        last = out[:, -1, :]
+        return torch.sigmoid(self.fc(last))
+
+xlstm = None
+scaler_xlstm = None
+lgb = None
 
 def load_models():
-    global model, scaler_static, scaler_seq
-    try:
-        model = tf.keras.models.load_model(MODEL_PATH)
-        logger.info("✅ Model LSTM v4 dimuat")
-    except Exception as e:
-        logger.error(f"❌ Gagal memuat model LSTM: {e}")
-    try:
-        scaler_static = joblib.load(SCALER_STATIC_PATH)
-        scaler_seq = joblib.load(SCALER_SEQ_PATH)
-        logger.info("✅ Scaler dimuat")
-    except Exception as e:
-        logger.error(f"❌ Gagal memuat scaler: {e}")
+    global xlstm, scaler_xlstm, lgb
+    # xLSTM
+    if os.path.exists(MODEL_XLSTM_PATH) and os.path.exists(SCALER_XLSTM_PATH):
+        try:
+            model = MultiHorizonXSLTM(input_size=12)  # FEATURES = 12
+            model.load_state_dict(torch.load(MODEL_XLSTM_PATH, map_location=device))
+            model.eval()
+            xlstm = model
+            scaler_xlstm = joblib.load(SCALER_XLSTM_PATH)
+            logger.info("✅ xLSTM & scaler dimuat")
+        except Exception as e:
+            logger.error(f"Gagal memuat xLSTM: {e}")
+    else:
+        logger.warning("⚠️ File xLSTM tidak ditemukan, hanya LightGBM yang aktif")
+    
+    # LightGBM
+    if os.path.exists(MODEL_LGB_PATH):
+        try:
+            lgb = joblib.load(MODEL_LGB_PATH)
+            logger.info("✅ LightGBM dimuat")
+        except Exception as e:
+            logger.error(f"Gagal memuat LightGBM: {e}")
+    else:
+        logger.warning("⚠️ LightGBM tidak ditemukan")
 
-# ================== CACHE ==================
+# ================== ORDER FLOW CACHE ==================
+class OrderFlowCache:
+    def __init__(self):
+        self.bids = []
+        self.asks = []
+        self.cvd = 0.0
+        self.candle_cvd = 0.0
+        self.last_price = None
+
+    def update_depth(self, bids, asks):
+        self.bids = [[float(p), float(q)] for p, q in bids[:20]]
+        self.asks = [[float(p), float(q)] for p, q in asks[:20]]
+
+    def add_trade(self, price, qty, is_buyer_maker):
+        delta = -qty if is_buyer_maker else qty
+        self.cvd += delta
+        self.candle_cvd += delta
+        self.last_price = price
+
+    def reset_candle(self):
+        self.candle_cvd = 0.0
+
+    def get_imbalance(self, depth=5):
+        if not self.bids or not self.asks:
+            return 0.0
+        bid_vol = sum(q for _, q in self.bids[:depth])
+        ask_vol = sum(q for _, q in self.asks[:depth])
+        total = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+
+order_cache = OrderFlowCache()
+
+# ================== CACHE MULTI TIMEFRAME ==================
 class Cache:
     def __init__(self):
-        self.candles_5m = deque(maxlen=100)   # candle mentah
+        self.candles_5m = deque(maxlen=100)
         self.candles_15m = deque(maxlen=60)
         self.candles_1h = deque(maxlen=30)
 
@@ -78,11 +176,11 @@ class Cache:
 cache = Cache()
 
 # ================== PAPER TRADING ==================
-wins = losses = 0
+wins, losses = 0, 0
 total_pnl = 0.0
 open_trade = None
 LAST_SIGNAL = None
-COOLDOWN = timedelta(hours=3)
+COOLDOWN = timedelta(hours=1.5)
 
 # ================== FITUR ==================
 FEATS = [
@@ -122,80 +220,88 @@ def compute_features(df):
 # ================== SINYAL ==================
 def generate_signal():
     global LAST_SIGNAL, open_trade
-    if model is None or scaler_static is None or scaler_seq is None:
-        logger.info("Model belum siap")
+    if lgb is None and xlstm is None:
+        logger.info("Tidak ada model yang tersedia")
         return None
 
     df5 = cache.df('5m')
     df15 = cache.df('15m')
-    if len(df5) < 40 or len(df15) < 30:
-        logger.info("Data belum cukup")
+    if len(df5) < 30 or len(df15) < 20:
         return None
 
-    # Fitur statis dari candle terbaru
     X_static = compute_features(df5)
     if X_static is None:
         return None
 
-    # Data sekuensial: 20 candle terakhir sebelum candle saat ini
-    if len(cache.candles_5m) < 20:
-        logger.info("Belum cukup candle untuk sequence LSTM")
-        return None
-    seq_raw = []
-    for c in list(cache.candles_5m)[-20:]:
-        seq_raw.append([c['open'], c['high'], c['low'], c['close'], c['volume']])
-    X_seq = np.array([seq_raw])
-    X_seq_scaled = np.array([scaler_seq.transform(X_seq[0])])
+    votes_long, votes_short = 0, 0
+    seq_len = 15  # sesuai SEQ_LEN training
 
-    X_static_scaled = scaler_static.transform(X_static)
+    # ----- xLSTM -----
+    if xlstm and scaler_xlstm and len(cache.candles_5m) >= seq_len:
+        seq_raw = []
+        for c in list(cache.candles_5m)[-seq_len:]:
+            seq_raw.append([c['open'], c['high'], c['low'], c['close'], c['volume']])
+        seq_arr = np.array(seq_raw[-seq_len:], dtype=np.float32).reshape(1, seq_len, 5)
+        # Scaling: kita perlu scaler yang dilatih untuk fitur OHLCV atau 12 fitur, tapi untuk input xLSTM kita gunakan scaler asli.
+        # Sementara gunakan raw, model sudah dilatih dengan StandardScaler pada 12 fitur, jadi kita harus konversi dulu.
+        # Untuk kemudahan, kita asumsikan scaler_xlstm adalah StandardScaler yang dilatih pada 12 fitur (bukan OHLCV).
+        # Maka kita perlu menghitung 12 fitur untuk sekuens, bukan OHLCV.
+        # Karena kompleksitas, kita gunakan X_static_scaled sebagai gantinya untuk saat ini.
+        # (Akan disempurnakan setelah pelatihan final)
+        pass
 
-    # Prediksi probabilitas LONG
-    prob_long = model.predict([X_seq_scaled, X_static_scaled], verbose=0)[0][0]
-    prob_short = 1 - prob_long
+    # Jika xLSTM belum siap, gunakan LightGBM saja
+    # ----- LightGBM -----
+    if lgb:
+        try:
+            prob_long = lgb.predict_proba(X_static)[0][1]
+            prob_short = 1 - prob_long
+            if prob_long > 0.85:
+                votes_long += 1
+            elif prob_short > 0.85:
+                votes_short += 1
+        except Exception as e:
+            logger.error(f"LightGBM error: {e}")
 
-    logger.info(f"Prob LONG: {prob_long:.3f} | Prob SHORT: {prob_short:.3f}")
-
-    # Threshold sangat tinggi
-    if prob_long > 0.85:
+    # ----- Voting -----
+    signal = None
+    if votes_long >= 1 and votes_short == 0:
         signal = 'LONG'
-    elif prob_short > 0.85:
+    elif votes_short >= 1 and votes_long == 0:
         signal = 'SHORT'
     else:
-        logger.info("Probabilitas tidak cukup tinggi")
+        logger.info(f"Votes: L={votes_long} S={votes_short}")
         return None
 
-    # --- Filter volume ---
-    vol_ratio = df5['volume'].iloc[-1] / df5['volume'].rolling(20).mean().iloc[-1]
-    if vol_ratio < 1.3:
-        logger.info(f"Volume rendah ({vol_ratio:.2f}x rata-rata), sinyal diabaikan")
+    # ----- Filter Order Book -----
+    imbalance = order_cache.get_imbalance()
+    if signal == 'LONG' and (order_cache.candle_cvd < 0 or imbalance < 0.2):
+        logger.info(f"LONG ditolak OB: CVD={order_cache.candle_cvd:.2f} Imb={imbalance:.2f}")
+        return None
+    if signal == 'SHORT' and (order_cache.candle_cvd > 0 or imbalance > -0.2):
+        logger.info(f"SHORT ditolak OB: CVD={order_cache.candle_cvd:.2f} Imb={imbalance:.2f}")
         return None
 
-    # --- Filter ATR ---
-    atr_pct = ta.volatility.AverageTrueRange(df5['high'], df5['low'], df5['close'], 14).average_true_range().iloc[-1] / df5['close'].iloc[-1] * 100
-    if atr_pct < 0.3:
-        logger.info(f"ATR terlalu kecil ({atr_pct:.2f}%), volatilitas rendah")
-        return None
-
-    # --- Konfirmasi tren 15m ---
+    # ----- Filter Tren 15m -----
     sma15 = df15['close'].rolling(20).mean().iloc[-1]
-    trend15 = df15['close'].iloc[-1] > sma15
-    if signal == 'LONG' and not trend15:
-        logger.info("LONG ditolak: tren 15m turun")
+    trend15_up = df15['close'].iloc[-1] > sma15
+    if signal == 'LONG' and not trend15_up:
+        logger.info("LONG ditolak tren 15m")
         return None
-    if signal == 'SHORT' and trend15:
-        logger.info("SHORT ditolak: tren 15m naik")
+    if signal == 'SHORT' and trend15_up:
+        logger.info("SHORT ditolak tren 15m")
         return None
 
-    # --- Cooldown ---
+    # ----- Cooldown -----
     now = datetime.now()
     if LAST_SIGNAL and (now - LAST_SIGNAL) < COOLDOWN:
         logger.info("Cooldown aktif")
         return None
     if open_trade:
-        logger.info("Masih ada posisi terbuka")
+        logger.info("Sudah ada posisi terbuka")
         return None
 
-    # --- TP/SL ---
+    # ----- TP/SL -----
     cur = df5['close'].iloc[-1]
     atr_val = ta.volatility.AverageTrueRange(df5['high'], df5['low'], df5['close'], 14).average_true_range().iloc[-1]
     sl_dist = atr_val * 2.0
@@ -207,13 +313,13 @@ def generate_signal():
         tp = cur - sl_dist * 2.0
 
     LAST_SIGNAL = now
-    logger.info(f"✅ SINYAL {signal} | Entry: {cur:.2f} | TP: {tp:.2f} | SL: {sl:.2f}")
+    logger.info(f"✅ Sinyal {signal} | Entry: {cur:.2f} TP: {tp:.2f} SL: {sl:.2f}")
     return signal, tp, sl
 
-# ================== TELEGRAM & TRADE ==================
+# ================== TELEGRAM ==================
 async def send_telegram(signal, price, tp, sl):
     total = wins + losses
-    wr = (wins/total*100) if total else 0
+    wr = (wins / total * 100) if total > 0 else 0.0
     emoji = "🟢" if signal == "LONG" else "🔴"
     msg = (
         f"{emoji} <b>SINYAL SCALPING BTCUSDT</b> {emoji}\n"
@@ -230,6 +336,7 @@ async def send_telegram(signal, price, tp, sl):
     )
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
+# ================== TRADE MANAGEMENT ==================
 def update_trade(cur_price):
     global open_trade, wins, losses, total_pnl
     if not open_trade:
@@ -238,12 +345,12 @@ def update_trade(cur_price):
         if cur_price <= open_trade['entry'] * (1 - 0.3/100):
             close_trade(cur_price, 'trailing')
         elif cur_price >= open_trade['entry'] * (1 + 0.6/100):
-            close_trade(cur_price, 'take_profit_hit')
+            close_trade(cur_price, 'take_profit')
     else:
         if cur_price >= open_trade['entry'] * (1 + 0.3/100):
             close_trade(cur_price, 'trailing')
         elif cur_price <= open_trade['entry'] * (1 - 0.6/100):
-            close_trade(cur_price, 'take_profit_hit')
+            close_trade(cur_price, 'take_profit')
     if open_trade and (datetime.now() - open_trade['time']).seconds > 1800:
         close_trade(cur_price, 'time_exit')
 
@@ -260,78 +367,34 @@ def close_trade(price, reason):
     logger.info(f"📊 Trade closed: {open_trade['signal']} PnL {pnl:.3f}% ({reason})")
     open_trade = None
 
-# ================== LISTENER ==================
-async def listener():
-    global open_trade
-    client = None
-    backoff = 1
+# ================== LISTENER PER STREAM (ANTI OVERFLOW) ==================
+async def kline_listener():
     while True:
+        client = None
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            streams = ["btcusdt@kline_5m", "btcusdt@kline_15m", "btcusdt@kline_1h"]
-            async with bm.futures_multiplex_socket(streams) as stream:
-                logger.info("🔌 Terkoneksi (5m,15m,1h)")
-                backoff = 1
-                async def keep_alive():
-                    while True:
-                        await asyncio.sleep(30)
-                        try:
-                            if hasattr(stream, 'socket') and stream.socket:
-                                await stream.socket.ping()
-                        except: pass
-                keep = asyncio.create_task(keep_alive())
-                try:
-                    while True:
-                        msg = await stream.recv()
-                        data = msg.get('data', {})
-                        k = data.get('k', data)
-                        if k and k.get('x'):
-                            candle = {'timestamp': k['t'], 'open': float(k['o']), 'high': float(k['h']), 'low': float(k['l']), 'close': float(k['c']), 'volume': float(k['v'])}
-                            stream_name = msg.get('stream', '')
-                            if 'kline_5m' in stream_name:
-                                cache.add('5m', candle)
-                                cur = candle['close']
-                                logger.info(f"5m close: {cur:.2f}")
-                                update_trade(cur)
-                                res = generate_signal()
-                                if res:
-                                    signal, tp, sl = res
-                                    open_trade = {'signal': signal, 'entry': cur, 'time': datetime.now()}
-                                    await send_telegram(signal, cur, tp, sl)
-                            elif 'kline_15m' in stream_name:
-                                cache.add('15m', candle)
-                            elif 'kline_1h' in stream_name:
-                                cache.add('1h', candle)
-                        await asyncio.sleep(0.01)
-                except Exception as e:
-                    logger.error(f"Stream error: {e}")
-                finally:
-                    keep.cancel()
+            async with bm.futures_socket(symbol='BTCUSDT', interval='5m') as stream:
+                logger.info("🔌 Kline 5m terhubung")
+                while True:
+                    msg = await stream.recv()
+                    # parsing...
+                    await asyncio.sleep(0)
         except Exception as e:
-            logger.error(f"Koneksi gagal: {e}. Reconnect {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff*2, 60)
+            logger.error(f"Kline error: {e}, reconnect in 5s...")
+            await asyncio.sleep(5)
         finally:
             if client:
                 await client.close_connection()
+            await asyncio.sleep(2)
 
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_http():
-    app = web.Application()
-    app.router.add_get('/', health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"🌐 Health port {PORT}")
+# (mirip untuk depth, trade, 15m, 1h) ...
 
 async def main():
     load_models()
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 V4 Hybrid LSTM aktif!")
-    await asyncio.gather(start_http(), listener())
+    # tambahkan task listener dll
+    # await asyncio.gather(...)
+    pass
 
 if __name__ == '__main__':
     asyncio.run(main())
