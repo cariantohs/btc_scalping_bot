@@ -536,4 +536,8 @@ async def main():
         unified_socket_listener()
     )
 
-if 
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot dihentikan")
