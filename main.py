@@ -250,11 +250,8 @@ def generate_signal():
 
     # ----- xLSTM (jika tersedia) -----
     if xlstm and scaler_xlstm and len(cache.candles_5m) >= 15:
-        try:
-            # Sementara tidak digunakan – akan disempurnakan setelah scaler fix
-            pass
-        except Exception as e:
-            logger.error(f"xLSTM error: {e}")
+        # xLSTM belum diintegrasikan sepenuhnya karena perlu scaler yang sesuai
+        pass
 
     # ----- Voting -----
     signal = None
@@ -360,7 +357,7 @@ def close_trade(price, reason):
     logger.info(f"📊 Trade closed: {open_trade['signal']} PnL {pnl:.3f}% ({reason})")
     open_trade = None
 
-# ================== LISTENER TERPISAH ==================
+# ================== LISTENER TERPISAH (DIPERBAIKI) ==================
 async def kline_5m_listener():
     backoff = 1
     while True:
@@ -368,7 +365,7 @@ async def kline_5m_listener():
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.futures_socket(symbol='BTCUSDT', interval='5m') as stream:
+            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='5m') as stream:
                 logger.info("🔌 Kline 5m terhubung")
                 backoff = 1
                 while True:
@@ -409,7 +406,7 @@ async def kline_15m_listener():
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.futures_socket(symbol='BTCUSDT', interval='15m') as stream:
+            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='15m') as stream:
                 logger.info("🔌 Kline 15m terhubung")
                 backoff = 1
                 while True:
@@ -441,7 +438,7 @@ async def kline_1h_listener():
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.futures_socket(symbol='BTCUSDT', interval='1h') as stream:
+            async with bm.kline_futures_socket(symbol='BTCUSDT', interval='1h') as stream:
                 logger.info("🔌 Kline 1h terhubung")
                 backoff = 1
                 while True:
@@ -473,7 +470,7 @@ async def depth_listener():
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.futures_socket(symbol='BTCUSDT', depth='20') as stream:
+            async with bm.depth_futures_socket(symbol='BTCUSDT', speed='100ms') as stream:
                 logger.info("🔌 Depth terhubung")
                 backoff = 1
                 while True:
@@ -499,7 +496,7 @@ async def trade_listener():
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            async with bm.futures_socket(symbol='BTCUSDT') as stream:
+            async with bm.aggtrade_futures_socket(symbol='BTCUSDT') as stream:
                 logger.info("🔌 Trade terhubung")
                 backoff = 1
                 while True:
