@@ -241,32 +241,54 @@ def generate_signal():
 
     votes_long, votes_short = 0, 0
 
-    # ----- LightGBM -----
+    # ----- LightGBM (threshold lebih rendah) -----
     try:
         prob_long = lgb.predict_proba(X_static)[0][1]
         prob_short = 1 - prob_long
-        logger.info(f"🔍 Prob LONG: {prob_long:.4f} | Prob SHORT: {prob_short:.4f}")
-        if prob_long > 0.85:
+        logger.info(f"🔍 LightGBM Prob LONG: {prob_long:.4f} | SHORT: {prob_short:.4f}")
+        if prob_long > 0.70:
             votes_long += 1
             logger.info("✅ LightGBM vote LONG")
-        elif prob_short > 0.85:
+        elif prob_short > 0.70:
             votes_short += 1
             logger.info("✅ LightGBM vote SHORT")
         else:
-            logger.info("❌ Probabilitas LightGBM tidak cukup tinggi (<0.85)")
+            logger.info("❌ Probabilitas LightGBM tidak cukup tinggi (<0.70)")
     except Exception as e:
         logger.error(f"❌ LightGBM error: {e}")
         return None
 
-    # ----- xLSTM (jika tersedia) -----
-    if xlstm and scaler_xlstm and len(cache.candles_5m) >= 15:
-        logger.info("ℹ️ xLSTM tersedia tapi belum diintegrasikan")
-        pass
-    else:
-        if xlstm is None:
-            logger.info("ℹ️ xLSTM tidak tersedia")
-        elif len(cache.candles_5m) < 15:
-            logger.info(f"⏳ Candle 5m untuk xLSTM belum cukup ({len(cache.candles_5m)}/15)")
+    # ----- xLSTM (terintegrasi) -----
+    if xlstm is not None and scaler_xlstm is not None and len(cache.candles_5m) >= 15:
+        try:
+            recent_df = df5.iloc[-15:]
+            feat_list = []
+            for i in range(len(recent_df)):
+                sub_df = recent_df.iloc[:i+1]
+                f = compute_features(sub_df)
+                if f is not None:
+                    feat_list.append(f.values[0])
+                else:
+                    feat_list.append(np.zeros(len(FEATS)))
+            seq_arr = np.array(feat_list, dtype=np.float32)
+            seq_scaled = scaler_xlstm.transform(seq_arr)
+            input_tensor = torch.tensor(seq_scaled).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                xlstm_output = xlstm(input_tensor).cpu().numpy()[0]
+            xlstm_long = float(xlstm_output[0])
+            xlstm_short = 1.0 - xlstm_long
+            logger.info(f"🧠 xLSTM Prob LONG: {xlstm_long:.4f} | SHORT: {xlstm_short:.4f}")
+            if xlstm_long > 0.80:
+                votes_long += 1
+                logger.info("✅ xLSTM vote LONG")
+            elif xlstm_short > 0.80:
+                votes_short += 1
+                logger.info("✅ xLSTM vote SHORT")
+            else:
+                logger.info("❌ xLSTM tidak cukup yakin")
+        except Exception as e:
+            logger.error(f"❌ xLSTM inference error: {e}")
 
     # ----- Voting -----
     signal = None
@@ -409,6 +431,8 @@ async def unified_socket_listener():
                 "btcusdt@aggTrade"
             ]
             async with bm.futures_multiplex_socket(streams) as stream:
+                if hasattr(stream, 'socket') and hasattr(stream.socket, 'max_queue'):
+                    stream.socket.max_queue = 500
                 logger.info("🔌 Multiplex terhubung (5m,15m,1h,depth,trade)")
                 backoff = 1
 
@@ -494,8 +518,8 @@ async def unified_socket_listener():
                             is_buyer_maker = data.get('m', False)
                             order_cache.add_trade(price, qty, is_buyer_maker)
 
-                        # Jeda cegah overflow
-                        await asyncio.sleep(0.01)
+                        # Jeda yang lebih besar untuk mencegah overflow
+                        await asyncio.sleep(0.05)
 
                 except Exception as e:
                     logger.error(f"Stream error: {e}")
